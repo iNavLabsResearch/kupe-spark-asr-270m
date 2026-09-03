@@ -82,13 +82,9 @@ class AsrCollator:
 
 
 def load_splits(mimi_dir: str):
-    """Return (train_ds, val_ds) from the encoded dataset's `split` column."""
+    """Return (train_ds, val_ds) from a local encoded dataset dir."""
     from datasets import load_from_disk
 
-    ds = load_from_disk(mimi_dir)
-    train = ds.filter(lambda s: s == "train", input_columns="split", num_proc=4)
-    val = ds.filter(lambda s: s == "val", input_columns="split", num_proc=4)
-    if val.num_rows == 0:  # fallback if no val was reserved
-        split = train.train_test_split(test_size=0.02, seed=1337)
-        train, val = split["train"], split["test"]
-    return train, val
+    from .load import splits_from_dataset
+
+    return splits_from_dataset(load_from_disk(mimi_dir))

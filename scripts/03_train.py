@@ -2,6 +2,7 @@
 """Stage 3: train. Single GPU or, via `accelerate launch`, multi-GPU DDP.
 
     python scripts/03_train.py
+    python scripts/03_train.py --from-hub           # pull `mimi` from Hub
     accelerate launch scripts/03_train.py           # multi-GPU
     python scripts/03_train.py --epochs 5 --bs 32
 """
@@ -19,6 +20,10 @@ def main():
     ap.add_argument("--bs", type=int, default=None, help="per-device batch size")
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--no-push", action="store_true")
+    ap.add_argument(
+        "--from-hub", action="store_true",
+        help="download the `mimi` config from Hub even if a local copy exists",
+    )
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -30,7 +35,7 @@ def main():
         cfg.train.lr = args.lr
     if args.no_push:
         cfg.train.push_to_hub = False
-    train(cfg)
+    train(cfg, from_hub=args.from_hub)
 
 
 if __name__ == "__main__":

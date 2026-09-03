@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """Stage 2: Mimi-encode the audio to codebook-0 tokens, push the `mimi` config.
 
-    python scripts/02_encode_data.py
-    python scripts/02_encode_data.py --batch-max-frames 16000   # bigger GPU
+    python scripts/02_encode_data.py                         # local audio, else Hub
+    python scripts/02_encode_data.py --from-hub              # always pull `audio` from Hub
+    python scripts/02_encode_data.py --batch-max-frames 16000
 """
 import _bootstrap  # noqa: F401
 import argparse
@@ -17,6 +18,10 @@ def main():
     ap.add_argument("--config", default=None)
     ap.add_argument("--batch-max-frames", type=int, default=None)
     ap.add_argument("--no-push", action="store_true")
+    ap.add_argument(
+        "--from-hub", action="store_true",
+        help="download the `audio` config from Hub even if a local copy exists",
+    )
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -25,7 +30,7 @@ def main():
     if args.no_push:
         cfg.mimi.push = False
     hf_login()
-    encode(cfg)
+    encode(cfg, from_hub=args.from_hub)
 
 
 if __name__ == "__main__":

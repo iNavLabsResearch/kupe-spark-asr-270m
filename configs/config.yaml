@@ -36,7 +36,7 @@ data:
   shard_size: 2000        # examples per on-disk shard
   streaming: true
   num_proc: 8
-  push: true              # push `audio` config to the data repo after fetch
+  push: true              # 01 pushes `audio`; GPU 02/03 pull it if local is empty
 
 mimi:
   model_id: kyutai/mimi

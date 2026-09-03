@@ -40,9 +40,24 @@ pip install -r requirements.txt
 
 ## 1. Run the whole pipeline
 
+**Two machines (recommended):** CPU VM fetches and pushes `audio`; GPU VM pulls it, encodes, pushes `mimi`, trains.
+
 ```bash
-python scripts/00_create_repos.py     # create data + runs + model repos, seed data card
-python scripts/01_fetch_data.py       # stream, resample→24kHz, shard→parquet, push `audio` config
+# --- CPU VM (no GPU needed; ~300 GB disk, use --hub-only so local shards are deleted after push) ---
+python scripts/00_create_repos.py
+python scripts/01_fetch_data.py --hub-only     # stream → 24 kHz → push `audio` → delete local
+
+# --- GPU VM (empty artifacts/ is fine; scripts pull from Hub if local is missing) ---
+python scripts/02_encode_data.py --from-hub    # download `audio`, Mimi-encode, push `mimi`
+python scripts/03_train.py                     # local `mimi` if 02 just ran; else --from-hub
+python scripts/04_evaluate.py --push
+```
+
+Same box (needs enough disk for a local audio copy as well as the Hub push):
+
+```bash
+python scripts/00_create_repos.py
+python scripts/01_fetch_data.py       # stream, resample→24kHz, keep local + push `audio`
 python scripts/02_encode_data.py      # Mimi-encode → push `mimi` config (this is what we train on)
 python scripts/03_train.py            # train + live WER + final eval + push run to the runs repo
 python scripts/04_evaluate.py --push  # (re)evaluate a checkpoint, push the report

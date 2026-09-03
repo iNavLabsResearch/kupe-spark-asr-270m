@@ -2,11 +2,14 @@
 
 Streaming + per-language hour caps means we only download what we keep. Sources
 are interleaved round-robin per language for a balanced accent/domain mix.
-Output: local `audio` dataset (save_to_disk) + pushed `audio` config on the Hub.
+
+CPU VM (tight disk):  fetch --hub-only  -> push `audio`, delete local shards.
+GPU VM:               encode loads `audio` from Hub if local is empty.
 """
 from __future__ import annotations
 
 import os
+import shutil
 
 import numpy as np
 from tqdm import tqdm
@@ -44,13 +47,15 @@ def _to_mono_24k(array, sr: int, target_sr: int) -> np.ndarray:
     return np.ascontiguousarray(array, dtype=np.float32)
 
 
-def fetch(cfg) -> str:
+def fetch(cfg, *, hub_only: bool = False) -> str:
     import datasets
 
     datasets.utils.logging.set_verbosity_error()
     datasets.disable_progress_bars()          # kill "Resolving data files" spam
 
     token = require_token()
+    if hub_only and not cfg.data.push:
+        raise RuntimeError("--hub-only needs data.push=true; do not pass --no-push")
     target_sr = int(cfg.data.target_sr) if hasattr(cfg.data, "target_sr") else MIMI_SAMPLE_RATE
     shards_dir = os.path.join(cfg.paths.audio_dir, "shards")
     writer = ShardWriter(shards_dir, _features(target_sr), int(cfg.data.shard_size))
@@ -133,15 +138,23 @@ def fetch(cfg) -> str:
 
     shard_paths = writer.close()
     ds = load_all(shard_paths)
-
-    out_dir = os.path.join(cfg.paths.audio_dir, "dataset")
-    ds.save_to_disk(out_dir)
-    log.info("audio dataset saved -> %s (%d rows)", out_dir, ds.num_rows)
     log.info("hours per language: %s", {k: round(v / 3600, 1) for k, v in kept.items()})
+    log.info("audio rows=%d", ds.num_rows)
 
     if cfg.data.push:
         ds.push_to_hub(cfg.repos.data, config_name="audio", token=token,
                        commit_message="add audio config (raw 24kHz)")
         log.info("pushed `audio` config -> %s", cfg.repos.data)
 
+    out_dir = os.path.join(cfg.paths.audio_dir, "dataset")
+    if hub_only:
+        # ~1,100 h of 24 kHz WAV is ~190 GB. A second save_to_disk copy will
+        # blow a 300 GB CPU disk. Hub is the source of truth; GPU pulls it.
+        log.info("--hub-only: skipping local dataset copy, removing shards %s", shards_dir)
+        shutil.rmtree(shards_dir, ignore_errors=True)
+        return cfg.repos.data
+
+    ds.save_to_disk(out_dir)
+    log.info("audio dataset saved -> %s (%d rows)", out_dir, ds.num_rows)
+    shutil.rmtree(shards_dir, ignore_errors=True)
     return out_dir

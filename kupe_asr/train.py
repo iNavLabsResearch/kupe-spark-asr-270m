@@ -12,7 +12,8 @@ import time
 import torch
 from transformers import TrainerCallback
 
-from .data.collate import AsrCollator, SequenceBuilder, load_splits
+from .data.collate import AsrCollator, SequenceBuilder
+from .data.load import load_mimi_dataset, splits_from_dataset
 from .evaluate import run_eval, save_report
 from .hf_utils import ensure_repo, hf_login, init_wandb, log, upload_folder
 from .model import load_model
@@ -97,7 +98,7 @@ def _training_args(cfg, out_dir, run_name, use_wandb):
     )
 
 
-def train(cfg) -> str:
+def train(cfg, *, from_hub: bool = False) -> str:
     from transformers import Trainer, set_seed
 
     set_seed(cfg.seed)
@@ -116,9 +117,8 @@ def train(cfg) -> str:
     # model
     model = load_model(cfg.model.base_id, tmap.vocab_size, cfg.model.dtype, cfg.model.attn_impl)
 
-    # data
-    mimi_ds_dir = os.path.join(cfg.paths.mimi_dir, "dataset")
-    train_ds, val_ds = load_splits(mimi_ds_dir)
+    # data: local mimi dataset if present, otherwise Hub `mimi` config
+    train_ds, val_ds = splits_from_dataset(load_mimi_dataset(cfg, from_hub=from_hub))
     log.info("train=%d val=%d", train_ds.num_rows, val_ds.num_rows)
 
     builder = SequenceBuilder(tok, tmap, cfg.model.max_seq_len,

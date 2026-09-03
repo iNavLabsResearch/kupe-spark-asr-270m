@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from ..constants import MIMI_FRAME_RATE, MIMI_SAMPLE_RATE
 from ..hf_utils import hf_token, log, require_token
+from .load import load_audio_dataset
 from .shards import ShardWriter, load_all
 
 
@@ -32,10 +33,9 @@ def _features():
     })
 
 
-def encode(cfg) -> str:
+def encode(cfg, *, from_hub: bool = False) -> str:
     import datasets
     import torch
-    from datasets import load_from_disk
     from transformers import AutoFeatureExtractor, MimiModel
 
     datasets.utils.logging.set_verbosity_error()
@@ -51,9 +51,8 @@ def encode(cfg) -> str:
     mimi = MimiModel.from_pretrained(cfg.mimi.model_id, token=hf_token()).to(device).eval()
     log.info("Mimi loaded on %s (num_codebooks=%d, budget=%d frames)", device, n_cb, budget)
 
-    src_dir = os.path.join(cfg.paths.audio_dir, "dataset")
-    ds = load_from_disk(src_dir).sort("duration")
-    log.info("encoding %d clips from %s", ds.num_rows, src_dir)
+    ds = load_audio_dataset(cfg, from_hub=from_hub).sort("duration")
+    log.info("encoding %d clips", ds.num_rows)
 
     writer = ShardWriter(os.path.join(cfg.paths.mimi_dir, "shards"),
                          _features(), int(cfg.data.shard_size))

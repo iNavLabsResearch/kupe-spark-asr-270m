@@ -12,7 +12,7 @@ import os
 import torch
 
 from kupe_asr.config import load_config
-from kupe_asr.data.collate import load_splits
+from kupe_asr.data.load import load_mimi_dataset, splits_from_dataset
 from kupe_asr.evaluate import run_eval, save_report
 from kupe_asr.hf_utils import ensure_repo, hf_login, log, upload_folder
 from kupe_asr.tokenizer import load_tokenizer, token_map
@@ -30,6 +30,10 @@ def main():
     ap.add_argument("--config", default=None)
     ap.add_argument("--model-dir", default=None)
     ap.add_argument("--push", action="store_true")
+    ap.add_argument(
+        "--from-hub", action="store_true",
+        help="download the `mimi` config from Hub even if a local copy exists",
+    )
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -43,7 +47,7 @@ def main():
     tmap = token_map(tok)
     model = AutoModelForCausalLM.from_pretrained(model_dir).to(device).eval()
 
-    _, val_ds = load_splits(os.path.join(cfg.paths.mimi_dir, "dataset"))
+    _, val_ds = splits_from_dataset(load_mimi_dataset(cfg, from_hub=args.from_hub))
     report = run_eval(
         model, tok, tmap, val_ds, device,
         max_audio_frames=cfg.model.max_audio_frames,
