@@ -33,9 +33,13 @@ def _features():
 
 
 def encode(cfg) -> str:
+    import datasets
     import torch
     from datasets import load_from_disk
     from transformers import AutoFeatureExtractor, MimiModel
+
+    datasets.utils.logging.set_verbosity_error()
+    datasets.disable_progress_bars()
 
     token = require_token()
     device = "cuda" if torch.cuda.is_available() else "cpu"

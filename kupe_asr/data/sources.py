@@ -25,13 +25,14 @@ class SkipSource(Exception):
 
 
 # candidate config spellings per language for the "language-name" datasets
+# (IndicVoices/Vaani use lowercase language names -> try lowercase first)
 _NAME_CFG = {
-    "hi": ["Hindi", "hindi"],
-    "gu": ["Gujarati", "gujarati"],
-    "bn": ["Bengali", "bengali"],
-    "mr": ["Marathi", "marathi"],
-    "ur": ["Urdu", "urdu"],
-    "en": ["English", "english"],
+    "hi": ["hindi", "Hindi"],
+    "gu": ["gujarati", "Gujarati"],
+    "bn": ["bengali", "Bengali"],
+    "mr": ["marathi", "Marathi"],
+    "ur": ["urdu", "Urdu"],
+    "en": ["english", "English"],
 }
 _ISO_CFG = {c: [c] for c in ["en", "hi", "gu", "bn", "mr", "ur"]}
 
@@ -50,7 +51,8 @@ class Source:
     trust_remote_code: bool = False
 
 
-# Indic core comes from AI4Bharat + ARTPARK-IISc; English from Common Voice.
+# Indic core: AI4Bharat + ARTPARK-IISc (parquet, no script).
+# English: fsicoli CV mirror (script) + People's Speech (script-free backstop).
 SOURCES: list[Source] = [
     Source(
         name="indicvoices",
@@ -66,9 +68,16 @@ SOURCES: list[Source] = [
     ),
     Source(
         name="commonvoice",
-        hf_id="mozilla-foundation/common_voice_17_0",
-        lang_configs=_ISO_CFG,          # en, hi, gu, bn, mr, ur (some may be absent)
+        hf_id="fsicoli/common_voice_17_0",     # parquet mirror; mozilla's script is gone
+        lang_configs=_ISO_CFG,                 # en, hi, gu, bn, mr, ur
         splits=["train", "validation"],
+        trust_remote_code=True,
+    ),
+    Source(
+        name="peoples_speech",
+        hf_id="MLCommons/peoples_speech",       # 30k h English, CC-BY, no gate
+        lang_configs={"en": ["clean", "dirty"]},
+        splits=["train"],
         trust_remote_code=True,
     ),
 ]
@@ -143,13 +152,21 @@ def iter_examples(source: Source, lang: str, token: str) -> Iterator[tuple]:
     # ensure decode is on (some streams ship raw bytes)
     ds = ds.cast_column(audio_col, Audio())
 
-    for row in ds:
+    it = iter(ds)
+    while True:
+        try:
+            row = next(it)
+        except StopIteration:
+            return
+        except Exception as e:            # stream died -> surface it, stop this source
+            log.warning("stream %s/%s ended early: %s", source.name, lang, e)
+            return
         try:
             a = row[audio_col]
             text = row[text_col]
             if a is None or not text or not str(text).strip():
                 continue
             yield a["array"], a["sampling_rate"], str(text).strip()
-        except Exception as e:  # corrupt clip -> skip, keep going
+        except Exception as e:            # corrupt clip -> skip, keep going
             log.debug("row skipped in %s/%s: %s", source.name, lang, e)
             continue

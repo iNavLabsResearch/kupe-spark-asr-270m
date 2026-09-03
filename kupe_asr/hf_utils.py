@@ -18,6 +18,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("kupe")
 
+# keep the terminal readable: silence per-request HTTP chatter so tqdm shows.
+for _n in ("httpx", "urllib3", "filelock", "fsspec", "huggingface_hub",
+           "huggingface_hub.hf_api", "datasets"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
+
 _ENV_LOADED = False
 
 

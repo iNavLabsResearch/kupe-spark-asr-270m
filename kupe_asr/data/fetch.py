@@ -45,6 +45,11 @@ def _to_mono_24k(array, sr: int, target_sr: int) -> np.ndarray:
 
 
 def fetch(cfg) -> str:
+    import datasets
+
+    datasets.utils.logging.set_verbosity_error()
+    datasets.disable_progress_bars()          # kill "Resolving data files" spam
+
     token = require_token()
     target_sr = int(cfg.data.target_sr) if hasattr(cfg.data, "target_sr") else MIMI_SAMPLE_RATE
     shards_dir = os.path.join(cfg.paths.audio_dir, "shards")
@@ -63,9 +68,11 @@ def fetch(cfg) -> str:
         n = 0
 
         iters = []
+        by_src: dict[str, int] = {}
         for src in sources_for(lang):
             try:
                 iters.append([src.name, iter_examples(src, lang, token)])
+                by_src[src.name] = 0
             except SkipSource as e:
                 log.warning("skip %s/%s: %s", src.name, lang, e)
 
@@ -112,14 +119,17 @@ def fetch(cfg) -> str:
                     "audio": {"bytes": wav_bytes(wav, target_sr), "path": None},
                 })
                 n += 1
+                by_src[name] = by_src.get(name, 0) + 1
                 got_s += dur
                 if split == "val":
                     val_s += dur
                 pbar.update(dur)
         pbar.close()
         kept[lang] = got_s
-        log.info("lang %s: kept %.1f h (%d clips, %.1f min val)",
-                 lang, got_s / 3600, n, val_s / 60)
+        log.info("lang %s: kept %.1f h (%d clips, %.1f min val) | by source: %s",
+                 lang, got_s / 3600, n, val_s / 60, by_src)
+        if n == 0:
+            log.warning("lang %s produced 0 clips — check gate/access for its sources", lang)
 
     shard_paths = writer.close()
     ds = load_all(shard_paths)
