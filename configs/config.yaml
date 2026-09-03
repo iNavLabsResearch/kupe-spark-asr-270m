@@ -1,0 +1,83 @@
+# =========================================================================
+# kupe-spark-asr-270m — single source of truth for every stage.
+# Override `owner` with env HF_OWNER / HF_USERNAME.
+# =========================================================================
+project: kupe-spark-asr-270m
+owner: anuj-inavlabs
+seed: 1337
+
+repos:
+  data:  "{owner}/kupe-spark-asr-270m-data"    # dataset repo, configs: audio + mimi
+  runs:  "{owner}/kupe-spark-asr-270m-runs"    # every run: weights + eval reports
+  model: "{owner}/kupe-spark-asr-270m"         # (optional) final model
+
+paths:
+  root:          "./artifacts"
+  audio_dir:     "./artifacts/data/audio"      # raw resampled audio (local mirror of `audio` config)
+  mimi_dir:      "./artifacts/data/mimi"        # Mimi-encoded tokens (local mirror of `mimi` config)
+  tokenizer_dir: "./artifacts/tokenizer"        # extended Gemma tokenizer
+  runs_dir:      "./artifacts/runs"
+
+languages: [en, hi, gu, bn, ur, mr]
+
+data:
+  target_sr: 24000
+  # hours pulled per language (streaming stops at the cap -> bounded download).
+  max_hours_per_lang:
+    en: 300
+    hi: 400
+    bn: 200
+    mr: 120
+    gu: 60
+    ur: 40
+  min_dur: 1.0            # drop clips shorter than this (seconds)
+  max_dur: 20.0           # drop clips longer than this (seconds)
+  val_minutes_per_lang: 20
+  shard_size: 2000        # examples per on-disk shard
+  streaming: true
+  num_proc: 8
+  push: true              # push `audio` config to the data repo after fetch
+
+mimi:
+  model_id: kyutai/mimi
+  num_codebooks: 1        # codebook 0 = semantic (WavLM-distilled) -> 12.5 tok/s
+  batch_max_frames: 8000  # sum-of-frames VRAM budget per encode batch (raise on big GPUs)
+  push: true              # push `mimi` config after encoding
+
+model:
+  base_id: google/gemma-3-270m
+  dtype: bfloat16
+  attn_impl: sdpa          # or flash_attention_2 if installed
+  max_seq_len: 1024
+  max_audio_frames: 750    # 60 s @ 12.5 Hz
+  max_text_tokens: 256
+
+train:
+  epochs: 3
+  lr: 3.0e-4
+  min_lr_ratio: 0.1
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  per_device_batch_size: 16
+  grad_accum: 4
+  p_auto: 0.5              # fraction of examples trained in auto-language mode
+  logging_steps: 20
+  eval_steps: 500
+  save_steps: 500
+  save_total_limit: 3
+  gradient_checkpointing: false
+  num_workers: 8
+  bf16: true
+  push_to_hub: true        # push run folder (weights+reports) to the runs repo
+
+eval:
+  max_samples_per_lang: 300
+  auto_samples_per_lang: 100
+  max_new_tokens: 200
+
+stream:
+  chunk_ms: 320
+  max_context_s: 30
+  pre_llm_threshold: 0.30  # P(eos) crossing this -> PRE_HIT_LLM (prefetch the LLM)
+  eos_threshold: 0.85      # P(eos) crossing this / eos emitted -> END_OF_SPEECH
+  silence_ms: 800          # VAD fallback: this much trailing silence -> END_OF_SPEECH

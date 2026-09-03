@@ -1,0 +1,23 @@
+# --- core ML ---
+# Install torch FIRST, matched to your CUDA (see README). Example:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch>=2.3
+transformers>=4.56.0      # Gemma-3 + Mimi + eval_strategy
+datasets>=2.20.0,<4.0.0   # streaming + push_to_hub(config_name=...)
+accelerate>=0.33.0
+huggingface_hub>=0.24.0
+
+# --- audio ---
+soundfile>=0.12
+librosa>=0.10
+soxr>=0.3                 # fast resampling backend for librosa
+
+# --- metrics / tracking ---
+jiwer>=3.0               # WER / CER
+wandb>=0.17
+
+# --- utils ---
+python-dotenv>=1.0
+pyyaml>=6.0
+tqdm>=4.66
+numpy>=1.24
