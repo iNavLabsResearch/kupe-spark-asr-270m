@@ -171,22 +171,26 @@ def iter_examples(source: Source, lang: str, token: str, skip: int = 0) -> Itera
     audio_col = _find_audio_col(ds.features)
     text_col = _find_text_col(ds.features)
 
+    # Disable Audio decode: resume-skip (and normal reads) then cost only the
+    # parquet read, not soundfile decode + resample. We decode bytes ourselves.
+    try:
+        from datasets import Audio
+        ds = ds.cast_column(audio_col, Audio(decode=False))
+    except Exception as e:
+        log.debug("decode=False cast skipped for %s/%s: %s", source.name, lang, e)
+
+    it = iter(ds)
     if skip > 0:
-        log.info("fast-forward %s/%s by %d rows (no decode)", source.name, lang, skip)
-        try:
-            ds = ds.skip(skip)
-        except Exception as e:
-            log.warning("skip() unsupported for %s/%s (%s) — reading through", source.name, lang, e)
-            tmp = iter(ds)
-            for _ in range(skip):
-                try:
-                    next(tmp)
-                except StopIteration:
-                    return
-            it = tmp
-            ds = None
-    if ds is not None:
-        it = iter(ds)
+        from tqdm import tqdm
+        for _ in tqdm(range(skip), desc=f"resume-skip {source.name}/{lang}",
+                      unit="row", unit_scale=True):
+            try:
+                next(it)
+            except StopIteration:
+                return
+            except Exception as e:
+                log.warning("skip %s/%s ended early: %s", source.name, lang, e)
+                return
     while True:
         try:
             row = next(it)
