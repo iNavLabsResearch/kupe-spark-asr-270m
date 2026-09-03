@@ -107,6 +107,32 @@ def _find_text_col(features) -> str:
     raise SkipSource(f"no text column among {list(features)}")
 
 
+def _decode_audio(a):
+    """Return (float32 array, sampling_rate) from any HF audio cell shape.
+
+    Handles decoded Audio ({'array','sampling_rate'}) and raw structs
+    ({'bytes': ...} / {'path': ...}) so we never rely on a lazy cast_column.
+    """
+    import io
+
+    import numpy as np
+
+    if a is None:
+        return None, None
+    if isinstance(a, dict):
+        if a.get("array") is not None and a.get("sampling_rate"):
+            return np.asarray(a["array"], dtype=np.float32), int(a["sampling_rate"])
+        import soundfile as sf
+
+        if a.get("bytes"):
+            arr, sr = sf.read(io.BytesIO(a["bytes"]), dtype="float32", always_2d=False)
+            return arr, sr
+        if a.get("path"):
+            arr, sr = sf.read(a["path"], dtype="float32", always_2d=False)
+            return arr, sr
+    return None, None
+
+
 def _open_stream(source: Source, cfg: str, token: str):
     """Try each split for one config; return (IterableDataset, split) or raise."""
     from datasets import load_dataset
@@ -131,8 +157,6 @@ def iter_examples(source: Source, lang: str, token: str) -> Iterator[tuple]:
     Raises SkipSource before yielding anything if the source can't be opened.
     Per-row decode errors are swallowed so one bad clip never stops the stream.
     """
-    from datasets import Audio
-
     cfgs = source.lang_configs[lang]
     ds = split = None
     for cfg in cfgs:
@@ -149,8 +173,6 @@ def iter_examples(source: Source, lang: str, token: str) -> Iterator[tuple]:
         raise SkipSource(f"{source.name}:{lang} exposes no feature schema")
     audio_col = _find_audio_col(ds.features)
     text_col = _find_text_col(ds.features)
-    # ensure decode is on (some streams ship raw bytes)
-    ds = ds.cast_column(audio_col, Audio())
 
     it = iter(ds)
     while True:
@@ -162,11 +184,13 @@ def iter_examples(source: Source, lang: str, token: str) -> Iterator[tuple]:
             log.warning("stream %s/%s ended early: %s", source.name, lang, e)
             return
         try:
-            a = row[audio_col]
             text = row[text_col]
-            if a is None or not text or not str(text).strip():
+            if not text or not str(text).strip():
                 continue
-            yield a["array"], a["sampling_rate"], str(text).strip()
+            arr, sr = _decode_audio(row[audio_col])
+            if arr is None:
+                continue
+            yield arr, sr, str(text).strip()
         except Exception as e:            # corrupt clip -> skip, keep going
             log.debug("row skipped in %s/%s: %s", source.name, lang, e)
             continue
