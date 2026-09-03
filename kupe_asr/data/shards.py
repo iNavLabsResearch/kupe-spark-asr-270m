@@ -23,10 +23,13 @@ def wav_bytes(array: np.ndarray, sr: int) -> bytes:
 
 
 class ShardWriter:
-    def __init__(self, out_dir: str, features, shard_size: int):
+    def __init__(self, out_dir: str, features, shard_size: int, start_index: int = 0,
+                 on_flush=None):
         self.out_dir = out_dir
         self.features = features
         self.shard_size = shard_size
+        self._next_idx = int(start_index)
+        self.on_flush = on_flush          # (arrow_dir, idx, nrows) -> None
         self.rows: list[dict] = []
         self.shard_paths: list[str] = []
         os.makedirs(out_dir, exist_ok=True)
@@ -36,17 +39,29 @@ class ShardWriter:
         if len(self.rows) >= self.shard_size:
             self._flush()
 
+    def _take_index(self) -> int:
+        while True:
+            path = os.path.join(self.out_dir, f"shard_{self._next_idx:05d}")
+            if not os.path.exists(path):
+                idx = self._next_idx
+                self._next_idx += 1
+                return idx
+            self._next_idx += 1
+
     def _flush(self) -> None:
         if not self.rows:
             return
         from datasets import Dataset
 
-        idx = len(self.shard_paths)
+        idx = self._take_index()
         path = os.path.join(self.out_dir, f"shard_{idx:05d}")
+        n = len(self.rows)
         Dataset.from_list(self.rows, features=self.features).save_to_disk(path)
         self.shard_paths.append(path)
-        log.info("flushed %s (%d rows)", path, len(self.rows))
+        log.info("flushed %s (%d rows)", path, n)
         self.rows = []
+        if self.on_flush:
+            self.on_flush(path, idx, n)
 
     def close(self):
         self._flush()

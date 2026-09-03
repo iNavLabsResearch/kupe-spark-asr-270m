@@ -43,9 +43,10 @@ pip install -r requirements.txt
 **Two machines (recommended):** CPU VM fetches and pushes `audio`; GPU VM pulls it, encodes, pushes `mimi`, trains.
 
 ```bash
-# --- CPU VM (no GPU needed; ~300 GB disk, use --hub-only so local shards are deleted after push) ---
+# --- CPU VM ---
 python scripts/00_create_repos.py
-python scripts/01_fetch_data.py --hub-only     # stream → 24 kHz → push `audio` → delete local
+python scripts/01_fetch_data.py --status           # leftover local shards + Hub progress
+python scripts/01_fetch_data.py --hub-only         # upload leftover shards, then fetch; each shard goes to Hub immediately
 
 # --- GPU VM (empty artifacts/ is fine; scripts pull from Hub if local is missing) ---
 python scripts/02_encode_data.py --from-hub    # download `audio`, Mimi-encode, push `mimi`
@@ -141,11 +142,33 @@ The **encode + download** dominate, not training. All GPUs above fit full fine-t
 
 ---
 
-## 6. Repos (on `anuj-inavlabs`)
+## 6. Repos & Hub data layout (on `anuj-inavlabs`)
 
-- `kupe-spark-asr-270m-data` — dataset, two configs: **audio** (raw) + **mimi** (tokens). Viewer works for both.
-- `kupe-spark-asr-270m-runs` — every run pushed to `runs/<run>/` (weights + `eval_report.md`/`.json` + configs + trainer history).
+**`kupe-spark-asr-270m-data`** (dataset) — two loadable configs, sharded parquet, resumable:
+
+```
+kupe-spark-asr-270m-data/
+├── README.md                     # dataset card: declares the two configs below
+├── audio/
+│   ├── data/shard_00000.parquet  # raw 24kHz mono + text, one file per shard
+│   ├── data/shard_00001.parquet  #   (uploaded live, one commit per shard)
+│   ├── fetch_state.json          # resume state: per-lang hours + shard/upload status
+│   └── seen_fps.txt              # clip fingerprints -> exact-once, dedup on resume
+└── mimi/
+    └── *.parquet                 # Mimi codebook-0 tokens + text  ← training reads this
+```
+
+Load either config directly — columns: `id, language, source, text, duration, split` (+`audio` or `mimi_cb0`):
+
+```python
+from datasets import load_dataset
+mimi = load_dataset("anuj-inavlabs/kupe-spark-asr-270m-data", "mimi", split="train")   # train on this
+```
+
+- `kupe-spark-asr-270m-runs` — every run at `runs/<run>/` (weights + `eval_report.md`/`.json` + trainer history).
 - `kupe-spark-asr-270m` — latest model weights.
+
+**Progress bars** (all real-time): fetch shows per-language `x.xx/NNh` audio-hours + clip counts; each shard prints an **upload MB bar** as it commits; `--from-hub` shows a **download MB bar** per parquet. `--status` prints hours/shards uploaded per language without fetching.
 
 ## 7. Layout
 

@@ -1,10 +1,12 @@
-"""Stage 1 — stream verified sources, resample to 24 kHz mono, shard to parquet.
+"""Stage 1 — stream sources, shard, upload each shard to Hub, resume later.
 
-Streaming + per-language hour caps means we only download what we keep. Sources
-are interleaved round-robin per language for a balanced accent/domain mix.
+Each flushed shard is converted to parquet and committed immediately with
+`audio/fetch_state.json` so a crash does not lose Hub progress.
 
-CPU VM (tight disk):  fetch --hub-only  -> push `audio`, delete local shards.
-GPU VM:               encode loads `audio` from Hub if local is empty.
+On restart:
+  1. index leftover local shards
+  2. upload any shard not yet on Hub
+  3. continue fetching from the hour caps in fetch_state.json
 """
 from __future__ import annotations
 
@@ -15,9 +17,21 @@ import numpy as np
 from tqdm import tqdm
 
 from ..constants import LANGUAGES, MIMI_SAMPLE_RATE
-from ..hf_utils import log, require_token
+from ..hf_utils import ensure_repo, log, require_token
 from ..text import is_probably_valid, normalize
-from .shards import ShardWriter, load_all, wav_bytes
+from .fetch_state import (
+    clip_fp,
+    empty_lang,
+    ensure_data_card,
+    ingest_local_shard,
+    list_local_shards,
+    load_merged_state,
+    persist_state,
+    print_status,
+    upload_arrow_shard,
+    upsert_shard,
+)
+from .shards import ShardWriter, wav_bytes
 from .sources import SkipSource, iter_examples, sources_for
 
 
@@ -39,7 +53,7 @@ def _to_mono_24k(array, sr: int, target_sr: int) -> np.ndarray:
     import librosa
 
     array = np.asarray(array, dtype=np.float32)
-    if array.ndim > 1:                      # stereo -> mono (channels = smallest axis)
+    if array.ndim > 1:
         ch_axis = int(np.argmin(array.shape))
         array = np.asarray(array.mean(axis=ch_axis), dtype=np.float32).reshape(-1)
     if sr != target_sr:
@@ -47,47 +61,160 @@ def _to_mono_24k(array, sr: int, target_sr: int) -> np.ndarray:
     return np.ascontiguousarray(array, dtype=np.float32)
 
 
-def fetch(cfg, *, hub_only: bool = False) -> str:
+def _counted_shard_indices(state: dict, hub_indices: set[int]) -> set[int]:
+    counted = set(hub_indices)
+    has_counts = any(
+        int((st or {}).get("n_clips", 0)) > 0
+        for st in (state.get("languages") or {}).values()
+    )
+    for s in state.get("shards") or []:
+        idx = int(s["index"])
+        if int(s.get("rows") or 0) > 0 or has_counts:
+            counted.add(idx)
+    return counted
+
+
+def _index_and_upload_local(cfg, state: dict, seen: set[str], hub_indices: set[int],
+                            shards_dir: str, *, push: bool, hub_only: bool) -> None:
+    local = list_local_shards(shards_dir)
+    if local:
+        log.info("found %d local shard(s) under %s", len(local), shards_dir)
+    counted = _counted_shard_indices(state, hub_indices)
+
+    for idx, path in local:
+        if idx not in counted:
+            ingest_local_shard(state, list(cfg.languages), idx, path, seen)
+            counted.add(idx)
+        else:
+            upsert_shard(state, idx, rows=int(next(
+                (s.get("rows") or 0 for s in state["shards"] if int(s["index"]) == idx), 0
+            )), uploaded=idx in hub_indices)
+
+        already = idx in hub_indices or any(
+            int(s["index"]) == idx and s.get("uploaded") for s in state["shards"]
+        )
+        if already:
+            log.info("shard_%05d already on Hub — skip upload", idx)
+            upsert_shard(state, idx, rows=0, uploaded=True)
+            if hub_only:
+                shutil.rmtree(path, ignore_errors=True)
+                log.info("removed local shard_%05d (already on Hub)", idx)
+            continue
+        if not push:
+            log.info("shard_%05d local only (--no-push)", idx)
+            continue
+        log.info("uploading leftover local shard_%05d first…", idx)
+        upload_arrow_shard(cfg, state, seen, idx, path, drop_local=hub_only)
+        hub_indices.add(idx)
+
+    persist_state(cfg, state, seen)
+
+
+def fetch_status(cfg, *, reset: bool = False) -> dict:
+    token = require_token()
+    ensure_repo(cfg.repos.data, "dataset")
+    state, seen, hub_indices = load_merged_state(cfg, reset=reset)
+    shards_dir = os.path.join(cfg.paths.audio_dir, "shards")
+    counted = _counted_shard_indices(state, hub_indices)
+    for idx, path in list_local_shards(shards_dir):
+        if idx not in counted:
+            ingest_local_shard(state, list(cfg.languages), idx, path, seen)
+    print_status(state, cfg.data.max_hours_per_lang, hub_indices)
+    persist_state(cfg, state, seen)
+    return state
+
+
+def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
     import datasets
 
     datasets.utils.logging.set_verbosity_error()
-    datasets.disable_progress_bars()          # kill "Resolving data files" spam
+    # keep tqdm bars ON (download/resolve/upload MB bars); only httpx logs are silenced.
 
     token = require_token()
     if hub_only and not cfg.data.push:
         raise RuntimeError("--hub-only needs data.push=true; do not pass --no-push")
+
+    ensure_repo(cfg.repos.data, "dataset")
+    if cfg.data.push:
+        ensure_data_card(cfg)
+
     target_sr = int(cfg.data.target_sr) if hasattr(cfg.data, "target_sr") else MIMI_SAMPLE_RATE
     shards_dir = os.path.join(cfg.paths.audio_dir, "shards")
-    writer = ShardWriter(shards_dir, _features(target_sr), int(cfg.data.shard_size))
+    os.makedirs(shards_dir, exist_ok=True)
 
-    kept = {lang: 0.0 for lang in cfg.languages}
+    state, seen, hub_indices = load_merged_state(cfg, reset=reset)
+    _index_and_upload_local(
+        cfg, state, seen, hub_indices, shards_dir,
+        push=bool(cfg.data.push), hub_only=hub_only,
+    )
+    print_status(state, cfg.data.max_hours_per_lang, hub_indices)
+
+    start_index = int(state.get("next_shard_index") or 0)
+    for s in state.get("shards") or []:
+        start_index = max(start_index, int(s["index"]) + 1)
+    if hub_indices:
+        start_index = max(start_index, max(hub_indices) + 1)
+
+    def on_flush(arrow_dir: str, idx: int, nrows: int) -> None:
+        upsert_shard(state, idx, nrows, uploaded=False)
+        persist_state(cfg, state, seen)
+        if not cfg.data.push:
+            log.info("shard_%05d saved locally (%d rows) — not uploaded (--no-push)", idx, nrows)
+            return
+        upload_arrow_shard(cfg, state, seen, idx, arrow_dir, drop_local=hub_only)
+        hub_indices.add(idx)
+
+    writer = ShardWriter(
+        shards_dir, _features(target_sr), int(cfg.data.shard_size),
+        start_index=start_index, on_flush=on_flush,
+    )
+
     caps = cfg.data.max_hours_per_lang
 
     for lang in cfg.languages:
         cap_s = float(getattr(caps, lang, 0)) * 3600.0
         if cap_s <= 0:
             continue
+        st = state["languages"].setdefault(lang, empty_lang())
+        got_s = float(st.get("kept_seconds") or 0)
+        val_s = float(st.get("val_seconds") or 0)
+        n = int(st.get("next_clip_index") or st.get("n_clips") or 0)
         val_cap_s = float(cfg.data.val_minutes_per_lang) * 60.0
-        got_s = 0.0
-        val_s = 0.0
-        n = 0
+        by_src = dict(st.get("by_source") or {})
+
+        if got_s >= cap_s:
+            st["status"] = "done"
+            log.info("skip %s — already have %.1f h (cap %.1f h)", lang, got_s / 3600, cap_s / 3600)
+            continue
+
+        st["status"] = "in_progress"
+        persist_state(cfg, state, seen)
 
         iters = []
-        by_src: dict[str, int] = {}
+        skip_left: dict[str, int] = {}
         for src in sources_for(lang):
             try:
                 iters.append([src.name, iter_examples(src, lang, token)])
-                by_src[src.name] = 0
+                skip_left[src.name] = int(by_src.get(src.name, 0))
+                by_src.setdefault(src.name, 0)
             except SkipSource as e:
                 log.warning("skip %s/%s: %s", src.name, lang, e)
 
         if not iters:
             log.warning("no sources available for %s — skipping", lang)
+            st["status"] = "done"
             continue
 
+        for name, nskip in skip_left.items():
+            if nskip:
+                log.info("resume %s/%s: skipping ~%d already-kept yields", lang, name, nskip)
+
+        dups = 0
         active = iters[:]
-        pbar = tqdm(total=cap_s, unit="s", unit_scale=True,
-                    desc=f"fetch {lang} ({LANGUAGES[lang]})")
+        pbar = tqdm(total=cap_s / 3600.0, initial=got_s / 3600.0, unit="h",
+                    desc=f"fetch {lang} ({LANGUAGES[lang]})",
+                    bar_format="{l_bar}{bar}| {n:.2f}/{total:.1f}h "
+                               "[{elapsed}<{remaining}] {postfix}")
         while active and got_s < cap_s:
             for entry in list(active):
                 if got_s >= cap_s:
@@ -98,8 +225,12 @@ def fetch(cfg, *, hub_only: bool = False) -> str:
                 except StopIteration:
                     active.remove(entry)
                     continue
-                except Exception as e:               # keep the stream alive
+                except Exception as e:
                     log.debug("next() error %s/%s: %s", name, lang, e)
+                    continue
+
+                if skip_left.get(name, 0) > 0:
+                    skip_left[name] -= 1
                     continue
 
                 if not is_probably_valid(text):
@@ -113,48 +244,71 @@ def fetch(cfg, *, hub_only: bool = False) -> str:
                 if dur < cfg.data.min_dur or dur > cfg.data.max_dur:
                     continue
 
+                text_n = normalize(text)
+                fp = clip_fp(lang, name, text_n, dur)
+                if fp in seen:
+                    dups += 1
+                    if dups % 500 == 0:
+                        log.info("resume %s: skipped %d clips already in shards/Hub", lang, dups)
+                    continue
+
                 split = "val" if val_s < val_cap_s else "train"
                 writer.add({
                     "id": f"{lang}-{name}-{n:08d}",
                     "language": lang,
                     "source": name,
-                    "text": normalize(text),
+                    "text": text_n,
                     "duration": float(dur),
                     "split": split,
                     "audio": {"bytes": wav_bytes(wav, target_sr), "path": None},
                 })
+                seen.add(fp)
                 n += 1
                 by_src[name] = by_src.get(name, 0) + 1
                 got_s += dur
                 if split == "val":
                     val_s += dur
-                pbar.update(dur)
+                st["kept_seconds"] = got_s
+                st["val_seconds"] = val_s
+                st["n_clips"] = int(st.get("n_clips") or 0) + 1
+                st["next_clip_index"] = n
+                st["by_source"] = by_src
+                pbar.update(dur / 3600.0)
+                if n % 200 == 0:
+                    pbar.set_postfix_str(f"{n} clips · {by_src}")
         pbar.close()
-        kept[lang] = got_s
-        log.info("lang %s: kept %.1f h (%d clips, %.1f min val) | by source: %s",
-                 lang, got_s / 3600, n, val_s / 60, by_src)
-        if n == 0:
+        st["kept_seconds"] = got_s
+        st["val_seconds"] = val_s
+        st["n_clips"] = int(st.get("n_clips") or 0)
+        st["next_clip_index"] = n
+        st["by_source"] = by_src
+        st["status"] = "done" if got_s >= cap_s or not active else "in_progress"
+        persist_state(cfg, state, seen)
+        log.info("lang %s: kept %.1f h (%d clips, %.1f min val) | by source: %s | %s",
+                 lang, got_s / 3600, st["n_clips"], val_s / 60, by_src, st["status"])
+        if st["n_clips"] == 0:
             log.warning("lang %s produced 0 clips — check gate/access for its sources", lang)
 
-    shard_paths = writer.close()
-    ds = load_all(shard_paths)
-    log.info("hours per language: %s", {k: round(v / 3600, 1) for k, v in kept.items()})
-    log.info("audio rows=%d", ds.num_rows)
-
+    writer.close()
+    local_state, local_fps = persist_state(cfg, state, seen)
     if cfg.data.push:
-        ds.push_to_hub(cfg.repos.data, config_name="audio", token=token,
-                       commit_message="add audio config (raw 24kHz)")
-        log.info("pushed `audio` config -> %s", cfg.repos.data)
+        from huggingface_hub import CommitOperationAdd, HfApi
+        try:
+            HfApi(token=token).create_commit(
+                repo_id=cfg.repos.data,
+                repo_type="dataset",
+                operations=[
+                    CommitOperationAdd(path_in_repo="audio/fetch_state.json", path_or_fileobj=local_state),
+                    CommitOperationAdd(path_in_repo="audio/seen_fps.txt", path_or_fileobj=local_fps),
+                ],
+                commit_message="fetch complete — update resume state",
+            )
+        except Exception as e:
+            log.warning("final state commit skipped: %s", e)
 
-    out_dir = os.path.join(cfg.paths.audio_dir, "dataset")
-    if hub_only:
-        # ~1,100 h of 24 kHz WAV is ~190 GB. A second save_to_disk copy will
-        # blow a 300 GB CPU disk. Hub is the source of truth; GPU pulls it.
-        log.info("--hub-only: skipping local dataset copy, removing shards %s", shards_dir)
-        shutil.rmtree(shards_dir, ignore_errors=True)
-        return cfg.repos.data
-
-    ds.save_to_disk(out_dir)
-    log.info("audio dataset saved -> %s (%d rows)", out_dir, ds.num_rows)
-    shutil.rmtree(shards_dir, ignore_errors=True)
-    return out_dir
+    hours = {k: round(float((state["languages"].get(k) or {}).get("kept_seconds") or 0) / 3600, 1)
+             for k in cfg.languages}
+    n_up = sum(1 for s in state.get("shards") or [] if s.get("uploaded"))
+    log.info("fetch done | hours=%s | shards uploaded=%d | repo=%s [audio]",
+             hours, n_up, cfg.repos.data)
+    return cfg.repos.data if hub_only or cfg.data.push else os.path.join(cfg.paths.audio_dir, "shards")

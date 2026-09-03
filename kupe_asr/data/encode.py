@@ -39,7 +39,7 @@ def encode(cfg, *, from_hub: bool = False) -> str:
     from transformers import AutoFeatureExtractor, MimiModel
 
     datasets.utils.logging.set_verbosity_error()
-    datasets.disable_progress_bars()
+    # keep tqdm bars ON so Hub download (MB) + mimi push progress are visible.
 
     token = require_token()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -105,6 +105,8 @@ def encode(cfg, *, from_hub: bool = False) -> str:
     if cfg.mimi.push:
         mds.push_to_hub(cfg.repos.data, config_name="mimi", token=token,
                         commit_message="add mimi config (codebook-0 tokens)")
+        from .fetch_state import ensure_data_card  # re-assert audio+mimi card
+        ensure_data_card(cfg)
         log.info("pushed `mimi` config -> %s", cfg.repos.data)
 
     return out_dir

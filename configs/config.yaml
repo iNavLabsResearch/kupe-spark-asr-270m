@@ -36,7 +36,7 @@ data:
   shard_size: 2000        # examples per on-disk shard
   streaming: true
   num_proc: 8
-  push: true              # 01 pushes `audio`; GPU 02/03 pull it if local is empty
+  push: true              # 01 uploads each shard to Hub as it is written; resume via fetch_state.json
 
 mimi:
   model_id: kyutai/mimi

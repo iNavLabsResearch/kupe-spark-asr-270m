@@ -1,4 +1,4 @@
-.PHONY: setup repos fetch fetch-hub encode encode-hub train train-hub train-multi eval stream all
+.PHONY: setup repos fetch fetch-status fetch-hub encode encode-hub train train-hub train-multi eval stream all
 
 setup:
 	pip install -r requirements.txt
@@ -9,7 +9,10 @@ repos:
 fetch:
 	python scripts/01_fetch_data.py
 
-# CPU VM (300 GB disk): stream sources, push `audio`, delete local shards
+fetch-status:
+	python scripts/01_fetch_data.py --status
+
+# CPU VM: upload leftover local shards, then fetch; delete each shard after Hub upload
 fetch-hub:
 	python scripts/01_fetch_data.py --hub-only
 
