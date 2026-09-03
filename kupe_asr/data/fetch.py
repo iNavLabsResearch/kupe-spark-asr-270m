@@ -191,11 +191,10 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
         persist_state(cfg, state, seen)
 
         iters = []
-        skip_left: dict[str, int] = {}
         for src in sources_for(lang):
             try:
-                iters.append([src.name, iter_examples(src, lang, token)])
-                skip_left[src.name] = int(by_src.get(src.name, 0))
+                nskip = int(by_src.get(src.name, 0))
+                iters.append([src.name, iter_examples(src, lang, token, skip=nskip)])
                 by_src.setdefault(src.name, 0)
             except SkipSource as e:
                 log.warning("skip %s/%s: %s", src.name, lang, e)
@@ -204,10 +203,6 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
             log.warning("no sources available for %s — skipping", lang)
             st["status"] = "done"
             continue
-
-        for name, nskip in skip_left.items():
-            if nskip:
-                log.info("resume %s/%s: skipping ~%d already-kept yields", lang, name, nskip)
 
         dups = 0
         active = iters[:]
@@ -227,10 +222,6 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
                     continue
                 except Exception as e:
                     log.debug("next() error %s/%s: %s", name, lang, e)
-                    continue
-
-                if skip_left.get(name, 0) > 0:
-                    skip_left[name] -= 1
                     continue
 
                 if not is_probably_valid(text):

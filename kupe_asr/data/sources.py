@@ -67,13 +67,6 @@ SOURCES: list[Source] = [
         splits=["train"],
     ),
     Source(
-        name="commonvoice",
-        hf_id="fsicoli/common_voice_17_0",     # parquet mirror; mozilla's script is gone
-        lang_configs=_ISO_CFG,                 # en, hi, gu, bn, mr, ur
-        splits=["train", "validation"],
-        trust_remote_code=True,
-    ),
-    Source(
         name="peoples_speech",
         hf_id="MLCommons/peoples_speech",       # 30k h English, CC-BY, no gate
         lang_configs={"en": ["clean", "dirty"]},
@@ -151,8 +144,12 @@ def _open_stream(source: Source, cfg: str, token: str):
     raise SkipSource(f"no readable split for {source.hf_id}:{cfg} ({last})")
 
 
-def iter_examples(source: Source, lang: str, token: str) -> Iterator[tuple]:
+def iter_examples(source: Source, lang: str, token: str, skip: int = 0) -> Iterator[tuple]:
     """Yield (audio_array, sampling_rate, text) for one (source, lang).
+
+    `skip` fast-forwards the stream at the source level (no audio decode), so
+    resume does not re-decode already-kept clips. It is a safe *under*-skip
+    (kept <= raw rows consumed); the fingerprint dedup handles the small overlap.
 
     Raises SkipSource before yielding anything if the source can't be opened.
     Per-row decode errors are swallowed so one bad clip never stops the stream.
@@ -174,7 +171,22 @@ def iter_examples(source: Source, lang: str, token: str) -> Iterator[tuple]:
     audio_col = _find_audio_col(ds.features)
     text_col = _find_text_col(ds.features)
 
-    it = iter(ds)
+    if skip > 0:
+        log.info("fast-forward %s/%s by %d rows (no decode)", source.name, lang, skip)
+        try:
+            ds = ds.skip(skip)
+        except Exception as e:
+            log.warning("skip() unsupported for %s/%s (%s) — reading through", source.name, lang, e)
+            tmp = iter(ds)
+            for _ in range(skip):
+                try:
+                    next(tmp)
+                except StopIteration:
+                    return
+            it = tmp
+            ds = None
+    if ds is not None:
+        it = iter(ds)
     while True:
         try:
             row = next(it)
