@@ -471,7 +471,7 @@ def _commit_with_backoff(fn, what: str) -> None:
         except Exception as e:
             rate = "429" in str(e) or "Too Many Requests" in str(e)
             log.warning("%s failed%s: %s", what, " (rate-limited)" if rate else "", e)
-            if attempt == len(delays) - 1:
+            if not rate or attempt == len(delays) - 1:   # only back off on rate limits
                 raise
 
 
@@ -488,7 +488,8 @@ def upload_pending(cfg, state: dict, seen: set[str]) -> int:
         log.info("bulk-uploading %d pending shard(s) in ONE commit…", len(files))
         _commit_with_backoff(
             lambda: api.upload_folder(
-                folder_path=pdir, path_in_repo=HUB_SHARD_DIR, repo_type="dataset",
+                repo_id=cfg.repos.data, repo_type="dataset",
+                folder_path=pdir, path_in_repo=HUB_SHARD_DIR,
                 commit_message=f"bulk upload {len(files)} audio shards",
             ),
             "folder upload",
