@@ -70,17 +70,19 @@ train:
   min_lr_ratio: 0.1
   warmup_ratio: 0.03
   weight_decay: 0.01
-  per_device_batch_size: 16
-  grad_accum: 4
+  per_device_batch_size: 32   # 270M is tiny; push to 128-256 on H100/RTX PRO 6000 (--bs)
+  grad_accum: 2
+  max_steps: 0             # 0 = use epochs; set >0 to cap steps
   p_auto: 0.5              # fraction of examples trained in auto-language mode
   logging_steps: 20
   eval_steps: 500
-  save_steps: 500
+  save_steps: 1000         # also pushes a resumable checkpoint to the runs repo each save
   save_total_limit: 3
   gradient_checkpointing: false
   num_workers: 8
   bf16: true
   push_to_hub: true        # push run folder (weights+reports) to the runs repo
+  push_checkpoints: true   # push last checkpoint to runs/<run>/last_checkpoint (resume anywhere)
 
 eval:
   max_samples_per_lang: 300

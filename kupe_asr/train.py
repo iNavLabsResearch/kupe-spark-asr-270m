@@ -5,8 +5,10 @@ Multi-GPU: launch with `accelerate launch` or `torchrun` — Trainer handles DDP
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
+import shutil
 import time
 
 import torch
@@ -15,9 +17,57 @@ from transformers import TrainerCallback
 from .data.collate import AsrCollator, SequenceBuilder
 from .data.load import load_mimi_dataset, splits_from_dataset
 from .evaluate import run_eval, save_report
-from .hf_utils import ensure_repo, hf_login, init_wandb, log, upload_folder
+from .hf_utils import ensure_repo, hf_login, hf_token, init_wandb, log, upload_folder
 from .model import load_model
 from .tokenizer import build_tokenizer, load_tokenizer, token_map
+
+
+class HubCheckpointCallback(TrainerCallback):
+    """Push the latest checkpoint (weights + optimizer) to runs/<run>/last_checkpoint
+    each save, so any box can resume/extend the run from the Hub."""
+
+    def __init__(self, cfg, run_name):
+        self.cfg = cfg
+        self.run_name = run_name
+
+    def on_save(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return control
+        ckpt = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if not os.path.isdir(ckpt):
+            return control
+        try:
+            ensure_repo(self.cfg.repos.runs, "model")
+            upload_folder(ckpt, self.cfg.repos.runs, "model",
+                          path_in_repo=f"runs/{self.run_name}/last_checkpoint",
+                          commit_message=f"{self.run_name}: checkpoint @ step {state.global_step}")
+            log.info("pushed checkpoint step %d to Hub (resumable)", state.global_step)
+        except Exception as e:
+            log.warning("checkpoint push failed: %s", e)
+        return control
+
+
+def _resume_checkpoint(cfg, run_name, hf_dir):
+    """Return a checkpoint path to resume from: newest local, else pulled from Hub."""
+    local = sorted(glob.glob(os.path.join(hf_dir, "checkpoint-*")),
+                   key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else -1)
+    if local:
+        log.info("resuming from local checkpoint %s", local[-1])
+        return local[-1]
+    try:
+        from huggingface_hub import snapshot_download
+        p = snapshot_download(cfg.repos.runs, repo_type="model", token=hf_token(),
+                              allow_patterns=[f"runs/{run_name}/last_checkpoint/*"])
+        src = os.path.join(p, "runs", run_name, "last_checkpoint")
+        if os.path.isdir(src) and os.listdir(src):
+            dest = os.path.join(hf_dir, "checkpoint-hub")
+            os.makedirs(hf_dir, exist_ok=True)
+            shutil.copytree(src, dest, dirs_exist_ok=True)
+            log.info("resuming from Hub checkpoint runs/%s/last_checkpoint", run_name)
+            return dest
+    except Exception as e:
+        log.warning("no Hub checkpoint for run %s (%s) — starting fresh", run_name, e)
+    return None
 
 
 def _tokenizer_exists(d: str) -> bool:
@@ -63,13 +113,20 @@ class WerCallback(TrainerCallback):
         return control
 
 
-def _training_args(cfg, out_dir, run_name, use_wandb):
+def _training_args(cfg, out_dir, run_name, use_wandb, *, overwrite: bool):
     from transformers import TrainingArguments
 
-    return TrainingArguments(
+    def _opt(**kw):
+        """Build TrainingArguments, dropping kwargs unknown to this transformers version."""
+        import inspect
+        allowed = set(inspect.signature(TrainingArguments.__init__).parameters)
+        return TrainingArguments(**{k: v for k, v in kw.items() if k in allowed})
+
+    return _opt(
         output_dir=os.path.join(out_dir, "hf"),
-        overwrite_output_dir=True,
+        overwrite_output_dir=overwrite,
         num_train_epochs=cfg.train.epochs,
+        max_steps=int(getattr(cfg.train, "max_steps", 0) or -1),
         per_device_train_batch_size=cfg.train.per_device_batch_size,
         per_device_eval_batch_size=cfg.train.per_device_batch_size,
         gradient_accumulation_steps=cfg.train.grad_accum,
@@ -78,33 +135,45 @@ def _training_args(cfg, out_dir, run_name, use_wandb):
         warmup_ratio=cfg.train.warmup_ratio,
         lr_scheduler_type="cosine",
         bf16=bool(cfg.train.bf16),
+        tf32=True,                          # Ampere+ matmul speedup (H100/4090/PRO6000)
+        optim="adamw_torch_fused",          # fused AdamW -> faster, less overhead
         gradient_checkpointing=bool(cfg.train.gradient_checkpointing),
+        group_by_length=True,               # batch similar lengths -> less padding, full GPU
+        length_column_name="num_frames",
         logging_steps=cfg.train.logging_steps,
         eval_strategy="steps",
         eval_steps=cfg.train.eval_steps,
         prediction_loss_only=True,          # never gather 258k-vocab logits (OOM); WER via callback
-
         save_strategy="steps",
         save_steps=cfg.train.save_steps,
         save_total_limit=cfg.train.save_total_limit,
+        save_safetensors=True,
         dataloader_num_workers=cfg.train.num_workers,
         dataloader_pin_memory=True,
         report_to=["wandb"] if use_wandb else ["none"],
         run_name=run_name,
-        remove_unused_columns=False,       # keep mimi_cb0/text/language for the collator
+        remove_unused_columns=False,        # keep mimi_cb0/text/language for the collator
         ddp_find_unused_parameters=False,
         seed=cfg.seed,
         logging_first_step=True,
     )
 
 
-def train(cfg, *, from_hub: bool = False) -> str:
+def train(cfg, *, from_hub: bool = False, resume: str | None = None) -> str:
     from transformers import Trainer, set_seed
 
     set_seed(cfg.seed)
+    torch.backends.cuda.matmul.allow_tf32 = True     # full-throughput matmul on Ampere+
+    torch.backends.cudnn.allow_tf32 = True
     hf_login()
 
-    run_name = f"{cfg.project}-{time.strftime('%Y%m%d-%H%M%S')}"
+    if resume:                                        # extend an existing run
+        run_name = resume
+        overwrite = False
+        log.info("=== extending run %s ===", run_name)
+    else:
+        run_name = f"{cfg.project}-{time.strftime('%Y%m%d-%H%M%S')}"
+        overwrite = True
     out_dir = os.path.join(cfg.paths.runs_dir, run_name)
     os.makedirs(out_dir, exist_ok=True)
     use_wandb = init_wandb(cfg.project, run_name, cfg.to_dict()) is not None
@@ -125,16 +194,20 @@ def train(cfg, *, from_hub: bool = False) -> str:
                               cfg.model.max_audio_frames, cfg.model.max_text_tokens)
     collator = AsrCollator(builder, tmap, cfg.train.p_auto, cfg.seed)
 
-    args = _training_args(cfg, out_dir, run_name, use_wandb)
+    args = _training_args(cfg, out_dir, run_name, use_wandb, overwrite=overwrite)
+    callbacks = [WerCallback(model, tok, tmap, val_ds, cfg)]
+    if bool(getattr(cfg.train, "push_checkpoints", True)):
+        callbacks.append(HubCheckpointCallback(cfg, run_name))
     trainer = Trainer(
         model=model, args=args,
         train_dataset=train_ds, eval_dataset=val_ds,
         data_collator=collator, processing_class=tok,
-        callbacks=[WerCallback(model, tok, tmap, val_ds, cfg)],
+        callbacks=callbacks,
     )
 
-    log.info("=== training %s ===", run_name)
-    trainer.train()
+    resume_ckpt = _resume_checkpoint(cfg, run_name, args.output_dir) if resume else None
+    log.info("=== training %s (resume=%s) ===", run_name, bool(resume_ckpt))
+    trainer.train(resume_from_checkpoint=resume_ckpt)
 
     # only the main process saves / evaluates / pushes (DDP-safe)
     if hasattr(trainer, "accelerator"):
