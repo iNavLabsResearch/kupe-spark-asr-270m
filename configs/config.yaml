@@ -75,8 +75,10 @@ train:
   min_lr_ratio: 0.1
   warmup_ratio: 0.03
   weight_decay: 0.01
-  per_device_batch_size: 32   # 270M is tiny; push to 128-256 on H100/RTX PRO 6000 (--bs)
-  grad_accum: 2
+  per_device_batch_size: 16   # 264k-vocab lm_head logits = batch*seq*264203*4 bytes, so the
+                          # batch must stay SMALL even though the model is tiny. 16 ≈ 17GB
+                          # logits peak; use 24-32 on 80-96GB, drop to 8 if it OOMs. NOT 128+.
+  grad_accum: 8           # effective batch = 16*8 = 128 without the memory cost
   max_steps: 0             # 0 = use epochs; set >0 to cap steps
   p_auto: 0.5              # fraction of examples trained in auto-language mode
   logging_steps: 20

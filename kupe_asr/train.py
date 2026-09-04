@@ -163,6 +163,7 @@ def train(cfg, *, from_hub: bool = False, resume: str | None = None) -> str:
     from transformers import Trainer, set_seed
 
     set_seed(cfg.seed)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation
     torch.backends.cuda.matmul.allow_tf32 = True     # full-throughput matmul on Ampere+
     torch.backends.cudnn.allow_tf32 = True
     hf_login()
