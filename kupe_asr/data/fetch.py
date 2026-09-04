@@ -225,11 +225,12 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False, defer_upload: boo
         cfg, state, seen, hub_indices, shards_dir,
         push=bool(cfg.data.push), hub_only=hub_only,
     )
-    if defer_upload:
-        _migrate_tmp_to_pending(cfg)   # any staged parquet -> pending (no commit)
-    elif cfg.data.push:
-        _recover_parquet_tmp(cfg, state, seen, hub_indices,
-                             int(getattr(cfg.data, "commit_batch", 25)))
+    _migrate_tmp_to_pending(cfg)       # staged parquet from a prior crash -> pending/
+    if cfg.data.push and not defer_upload and any(
+        f.endswith(".parquet") for f in os.listdir(pending_dir(cfg))
+    ):
+        log.info("flushing leftover pending/ from a previous run…")
+        upload_pending(cfg, state, seen)
     print_status(state, cfg.data.max_hours_per_lang, hub_indices)
 
     start_index = int(state.get("next_shard_index") or 0)
@@ -238,34 +239,18 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False, defer_upload: boo
     if hub_indices:
         start_index = max(start_index, max(hub_indices) + 1)
 
-    # Collect several shards locally, then upload them in ONE Hub commit.
-    # HF caps commits at 128/hour; one-commit-per-shard hits 429 fast.
-    staged: list[tuple[int, str, int]] = []
-    batch_n = int(getattr(cfg.data, "commit_batch", 25))
-
-    def flush_staged(force: bool = False) -> None:
-        if staged and (force or len(staged) >= batch_n):
-            commit_batch(cfg, state, seen, staged)
-            for idx, _, _ in staged:
-                hub_indices.add(idx)
-            staged.clear()
-
+    # Per-language upload: shards collect in pending/ during a language, then get
+    # pushed as ONE folder commit when that language finishes (and pending is cleared).
     def on_flush(arrow_dir: str, idx: int, nrows: int) -> None:
         upsert_shard(state, idx, nrows, uploaded=False)
         persist_state(cfg, state, seen)
         if not cfg.data.push:
             log.info("shard_%05d saved locally (%d rows) — not uploaded (--no-push)", idx, nrows)
             return
-        if defer_upload:            # collect locally now, upload later in one commit
-            stage_to_pending(cfg, arrow_dir, idx, drop_local=True)
-            log.info("shard_%05d (%d rows) -> pending/ (upload later with --upload-only)", idx, nrows)
-            _free_memory()
-            return
-        pq_path, rows = stage_shard(cfg, arrow_dir, idx, drop_local=hub_only)
-        staged.append((idx, pq_path, rows))
-        log.info("staged shard_%05d (%d rows) — %d/%d before next commit", idx, rows, len(staged), batch_n)
-        flush_staged()
-        _free_memory()          # keep RSS flat across many shards
+        stage_to_pending(cfg, arrow_dir, idx, drop_local=True)
+        where = "upload later with --upload-only" if defer_upload else "upload after this language"
+        log.info("shard_%05d (%d rows) -> pending/ (%s)", idx, nrows, where)
+        _free_memory()
 
     writer = ShardWriter(
         shards_dir, _features(target_sr), int(cfg.data.shard_size),
@@ -390,28 +375,20 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False, defer_upload: boo
         if st["n_clips"] == 0:
             log.warning("lang %s produced 0 clips — check gate/access for its sources", lang)
 
+        # === per-language upload: push this language's shards, then clear pending ===
+        if cfg.data.push and not defer_upload:
+            n_pend = len([f for f in os.listdir(pending_dir(cfg)) if f.endswith(".parquet")])
+            if n_pend:
+                log.info("=== uploading %s: %d shard(s) in ONE folder commit ===", lang, n_pend)
+                upload_pending(cfg, state, seen)   # uploads + deletes local pending
+                log.info("=== %s uploaded and cleared from local disk ===", lang)
+
     writer.close()
-    if not defer_upload:
-        flush_staged(force=True)      # upload any remaining staged shards in one commit
-    local_state, local_fps = persist_state(cfg, state, seen)
+    persist_state(cfg, state, seen)
     if defer_upload:
         n_pend = len([f for f in os.listdir(pending_dir(cfg)) if f.endswith(".parquet")])
         log.info("fetch (defer) done | %d shard(s) in pending/ — run: "
                  "python scripts/01_fetch_data.py --upload-only", n_pend)
-    if cfg.data.push and not defer_upload:
-        from huggingface_hub import CommitOperationAdd, HfApi
-        try:
-            HfApi(token=token).create_commit(
-                repo_id=cfg.repos.data,
-                repo_type="dataset",
-                operations=[
-                    CommitOperationAdd(path_in_repo="audio/fetch_state.json", path_or_fileobj=local_state),
-                    CommitOperationAdd(path_in_repo="audio/seen_fps.txt", path_or_fileobj=local_fps),
-                ],
-                commit_message="fetch complete — update resume state",
-            )
-        except Exception as e:
-            log.warning("final state commit skipped: %s", e)
 
     hours = {k: round(float((state["languages"].get(k) or {}).get("kept_seconds") or 0) / 3600, 1)
              for k in cfg.languages}
