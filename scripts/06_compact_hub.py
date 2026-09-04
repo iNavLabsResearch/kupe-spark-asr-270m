@@ -1,23 +1,23 @@
 #!/usr/bin/env python
 """Pack ~1000 tiny Hub parquet files into 1 bunch so training does not 429.
 
-The free Hub quota is 1000 API requests / 5 minutes. `03_train.py --from-hub`
-was downloading ~1000 mimi shard_*.parquet files and getting rate-limited.
-
-On 429 this script sleeps 5 minutes and retries. Cached files from the failed
-train run cost 0 API calls.
+Safe: original shard_*.parquet files stay on Hub until the new bunch is
+uploaded AND recorded in compact_ledger.json. Crash → re-run; it resumes.
 
     python scripts/06_compact_hub.py                 # mimi (unblocks train)
+    python scripts/06_compact_hub.py --status        # print ledger progress
     python scripts/03_train.py                       # uses the local copy just written
-
-    python scripts/06_compact_hub.py --audio         # optional: same for audio
-    python scripts/06_compact_hub.py --dry-run
 """
 import _bootstrap  # noqa: F401
 import argparse
 
 from kupe_asr.config import load_config
-from kupe_asr.data.bunch import DEFAULT_BUNCH_MAX_MB, DEFAULT_BUNCH_SIZE, compact_hub_config
+from kupe_asr.data.bunch import (
+    DEFAULT_BUNCH_MAX_MB,
+    DEFAULT_BUNCH_SIZE,
+    compact_hub_config,
+    compact_status,
+)
 from kupe_asr.hf_utils import hf_login, log
 
 
@@ -36,10 +36,17 @@ def main():
     ap.add_argument("--no-local", action="store_true",
                     help="do not write artifacts/data/mimi/dataset (train would need --from-hub)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--status", action="store_true",
+                    help="print compact_ledger.json progress and exit")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     hf_login()
+    if args.status:
+        compact_status(cfg, "mimi")
+        if args.audio:
+            compact_status(cfg, "audio")
+        return
 
     do_mimi = not args.no_mimi
     if do_mimi:

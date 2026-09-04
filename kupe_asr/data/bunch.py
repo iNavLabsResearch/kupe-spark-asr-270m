@@ -223,6 +223,121 @@ def download_many(repo_id: str, paths: list[str], token: str) -> list[str]:
     return local
 
 
+LEDGER_NAME = "compact_ledger.json"
+
+
+def ledger_local_path(cfg, config_name: str) -> str:
+    return os.path.join(getattr(cfg.paths, f"{config_name}_dir"), LEDGER_NAME)
+
+
+def ledger_hub_path(config_name: str) -> str:
+    return f"{config_name}/{LEDGER_NAME}"
+
+
+def _now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _empty_ledger(repo: str, config_name: str, bunch_size: int) -> dict:
+    return {
+        "version": 1,
+        "repo": repo,
+        "config": config_name,
+        "bunch_size": bunch_size,
+        "status": "in_progress",
+        "updated_at": _now(),
+        "plan": [],
+        "bunches": [],
+    }
+
+
+def _bunch_entry(ledger: dict, idx: int) -> dict | None:
+    for b in ledger.get("bunches") or []:
+        if int(b["index"]) == idx:
+            return b
+    return None
+
+
+def _upsert_bunch(ledger: dict, entry: dict) -> None:
+    bunches = ledger.setdefault("bunches", [])
+    for i, b in enumerate(bunches):
+        if int(b["index"]) == int(entry["index"]):
+            bunches[i] = {**b, **entry}
+            return
+    bunches.append(entry)
+    bunches.sort(key=lambda b: int(b["index"]))
+
+
+def save_ledger(path: str, ledger: dict) -> None:
+    """Atomic JSON write so a crash never leaves a half-written ledger."""
+    from .fetch_state import save_json
+    ledger = dict(ledger)
+    ledger["updated_at"] = _now()
+    save_json(path, ledger)
+    log.info("ledger saved %s  status=%s  bunches=%d",
+             path, ledger.get("status"), len(ledger.get("bunches") or []))
+
+
+def load_ledger(cfg, config_name: str, repo: str, bunch_size: int, token: str) -> dict:
+    """Local ledger wins; Hub copy fills gaps so a new box can resume too."""
+    from .fetch_state import load_json
+
+    local_p = ledger_local_path(cfg, config_name)
+    local = load_json(local_p) or {}
+    hub = {}
+    try:
+        from huggingface_hub import hf_hub_download
+        hp = hf_hub_download(repo, ledger_hub_path(config_name),
+                             repo_type="dataset", token=token)
+        hub = load_json(hp) or {}
+    except Exception:
+        hub = {}
+
+    if not local and not hub:
+        return _empty_ledger(repo, config_name, bunch_size)
+
+    out = _empty_ledger(repo, config_name, bunch_size)
+    out["bunch_size"] = int(local.get("bunch_size") or hub.get("bunch_size") or bunch_size)
+    plan_a, plan_b = local.get("plan") or [], hub.get("plan") or []
+    out["plan"] = plan_a if len(plan_a) >= len(plan_b) else plan_b
+    by_idx: dict[int, dict] = {}
+    for src in (hub.get("bunches") or [], local.get("bunches") or []):
+        for b in src:
+            idx = int(b["index"])
+            prev = by_idx.get(idx, {})
+            merged = {**prev, **b}
+            for key in ("concatenated_at", "uploaded_at", "sources_deleted_at"):
+                merged[key] = b.get(key) or prev.get(key)
+            by_idx[idx] = merged
+    out["bunches"] = [by_idx[i] for i in sorted(by_idx)]
+    if local.get("status") == "done" or hub.get("status") == "done":
+        out["status"] = "done"
+    save_ledger(local_p, out)
+    return out
+
+
+def compact_status(cfg, config_name: str = "mimi") -> dict:
+    from .fetch_state import load_json
+    token = require_token()
+    repo = cfg.repos.data
+    bunches, shards = list_config_parquets(repo, config_name, token)
+    ledger = load_json(ledger_local_path(cfg, config_name)) or {}
+    uploaded = [b for b in (ledger.get("bunches") or []) if b.get("uploaded_at")]
+    pending = [p for p in (ledger.get("plan") or [])
+               if not (_bunch_entry(ledger, int(p["index"])) or {}).get("uploaded_at")]
+    log.info("===== compact ledger (%s) =====", config_name)
+    log.info("  Hub: %d bunch(es), %d leftover tiny shard(s)", len(bunches), len(shards))
+    log.info("  ledger status: %s", ledger.get("status") or "none")
+    log.info("  bunches uploaded: %d / %d planned",
+             len(uploaded), len(ledger.get("plan") or []))
+    if pending:
+        log.info("  still to do: bunch indices %s", [int(p["index"]) for p in pending])
+    log.info("  re-run the same command to resume. originals stay on Hub until uploaded.")
+    log.info("================================")
+    return ledger
+
+
 def _commit_ops(api, repo_id: str, ops: list, message: str) -> None:
     from .fetch_state import _commit_with_backoff
 
@@ -245,81 +360,207 @@ def compact_hub_config(
     write_local: bool = False,
     dry_run: bool = False,
 ) -> dict:
-    """Rewrite `{config}/data/shard_*.parquet` on the Hub into `bunch_*.parquet`.
+    """Pack `{config}/data/shard_*.parquet` into `bunch_*.parquet`.
 
-    Order: concat locally -> upload bunches (train can start) -> delete shards.
-    Files already in the HF cache (GPU VM after the 429) cost 0 extra API calls.
+    Safe: originals on Hub are never deleted until that bunch is uploaded AND
+    the JSON ledger records `uploaded_at`. Crash → re-run; ledger resumes.
+
+    Ledger: `{audio|mimi}_dir/compact_ledger.json` (also pushed to Hub each bunch).
     """
     from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi
 
     token = require_token()
     repo = cfg.repos.data
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    prefix = data_prefix(config_name)
+    cfg_dir = getattr(cfg.paths, f"{config_name}_dir")
+    work = os.path.join(cfg_dir, "compact")
+    ledger_p = ledger_local_path(cfg, config_name)
+    os.makedirs(cfg_dir, exist_ok=True)
+
     bunches, shards = list_config_parquets(repo, config_name, token)
     log.info("%s Hub: %d bunch(es), %d shard(s)", config_name, len(bunches), len(shards))
-    if not shards:
+    ledger = load_ledger(cfg, config_name, repo, bunch_size, token)
+    done_sources = set()
+    for b in ledger.get("bunches") or []:
+        if b.get("uploaded_at"):
+            done_sources.update(b.get("source_shards") or [])
+
+    leftover = [s for s in shards if s not in done_sources]
+    need_delete = any(
+        b.get("uploaded_at") and not b.get("sources_deleted_at")
+        for b in (ledger.get("bunches") or [])
+    )
+
+    if not leftover and not shards and not need_delete:
         log.info("nothing to compact for `%s` — already bunched or empty", config_name)
         if write_local and bunches:
             files = download_many(repo, bunches, token)
             write_local_dataset(cfg, config_name, files)
+        ledger["status"] = "done"
+        save_ledger(ledger_p, ledger)
         return {"config": config_name, "bunches": len(bunches), "compacted": 0}
 
-    start = next_bunch_index(bunches)
-    max_bytes = int(bunch_max_mb) * 1024 * 1024 if bunch_max_mb else 0
-    log.info("packing %d shards into bunches of <=%d (start index %d)",
-             len(shards), bunch_size, start)
+    if not leftover and not need_delete and ledger.get("plan") and all(
+        (_bunch_entry(ledger, int(p["index"])) or {}).get("uploaded_at")
+        for p in ledger["plan"]
+    ):
+        log.info("`%s` ledger already complete", config_name)
+        if write_local:
+            hub_bunches, _ = list_config_parquets(repo, config_name, token)
+            files = [b.get("local_path") for b in (ledger.get("bunches") or [])
+                     if b.get("local_path") and os.path.isfile(b["local_path"])]
+            files = files or download_many(repo, hub_bunches, token)
+            if files:
+                write_local_dataset(cfg, config_name, files)
+        ledger["status"] = "done"
+        save_ledger(ledger_p, ledger)
+        return {"config": config_name, "bunches": len(ledger.get("bunches") or []), "compacted": 0}
+
+    if not ledger.get("plan"):
+        start = next_bunch_index(bunches)
+        if leftover:
+            groups = group_paths(leftover, bunch_size=bunch_size,
+                                 bunch_max_bytes=int(bunch_max_mb) * 1024 * 1024 if bunch_max_mb else 0)
+            ledger["plan"] = [
+                {"index": start + i, "source_shards": g} for i, g in enumerate(groups)
+            ]
+        else:
+            ledger["plan"] = [
+                {"index": int(b["index"]), "source_shards": list(b.get("source_shards") or [])}
+                for b in (ledger.get("bunches") or [])
+            ]
+        save_ledger(ledger_p, ledger)
+        log.info("ledger plan: %d bunch(es) from %d leftover shards",
+                 len(ledger["plan"]), len(leftover))
+
     if dry_run:
-        return {"config": config_name, "shards": len(shards), "start": start, "dry_run": True}
+        return {"config": config_name, "plan": ledger["plan"], "dry_run": True}
 
-    log.info("resolving shards (HF cache hits are free, 0 API calls)…")
-    local_shards = download_many(repo, shards, token)
-
-    cfg_dir = getattr(cfg.paths, f"{config_name}_dir")
-    work = os.path.join(cfg_dir, "compact")
-    made = bunch_local_parquets(
-        local_shards, work, start_index=start,
-        bunch_size=bunch_size, bunch_max_bytes=max_bytes,
-    )
-    prefix = data_prefix(config_name)
     api = HfApi(token=token)
+    made_local: list[dict] = []
 
-    add_ops = [
-        CommitOperationAdd(
-            path_in_repo=f"{prefix}{BUNCH_PREFIX}{b['index']:05d}.parquet",
-            path_or_fileobj=b["path"],
+    for step in ledger["plan"]:
+        idx = int(step["index"])
+        sources = list(step["source_shards"])
+        existing = _bunch_entry(ledger, idx) or {}
+        hub_path = f"{prefix}{BUNCH_PREFIX}{idx:05d}.parquet"
+        local_bunch = existing.get("local_path") or os.path.join(
+            work, f"{BUNCH_PREFIX}{idx:05d}.parquet"
         )
-        for b in made
-    ]
-    log.info("uploading %d bunch file(s) — training can start as soon as this commit lands",
-             len(add_ops))
-    _commit_ops(api, repo, add_ops,
-                f"{config_name}: compact {len(shards)} shards -> {len(made)} bunches")
-    log.info("bunches are on Hub. you can start training now:\n"
-             "  python scripts/03_train.py --from-hub")
 
-    _update_hub_state_after_compact(cfg, config_name, made, api, repo)
+        if existing.get("uploaded_at"):
+            log.info("bunch_%05d already uploaded (%s) — skip", idx, existing["uploaded_at"])
+            if not existing.get("sources_deleted_at"):
+                _, still = list_config_parquets(repo, config_name, token)
+                to_del = [s for s in sources if s in still]
+                del_ops = [CommitOperationDelete(path_in_repo=s) for s in to_del]
+                for i in range(0, len(del_ops), 200):
+                    chunk = del_ops[i:i + 200]
+                    _commit_ops(
+                        api, repo, chunk,
+                        f"{config_name}: delete shards for bunch_{idx:05d} "
+                        f"({i + 1}-{i + len(chunk)}/{len(del_ops)})",
+                    )
+                _upsert_bunch(ledger, {**existing, "sources_deleted_at": _now()})
+                save_ledger(ledger_p, ledger)
+            if os.path.isfile(local_bunch):
+                made_local.append({
+                    "index": idx, "path": local_bunch,
+                    "rows": existing.get("rows") or 0,
+                    "sources": [os.path.basename(s) for s in sources],
+                })
+            continue
 
-    del_ops = [CommitOperationDelete(path_in_repo=p) for p in shards]
-    batch = 200
-    for i in range(0, len(del_ops), batch):
-        chunk = del_ops[i:i + batch]
+        log.info("=== bunch_%05d: resolving %d shards ===", idx, len(sources))
+        local_shards = download_many(repo, sources, token)
+
+        if not (existing.get("concatenated_at") and os.path.isfile(local_bunch)):
+            os.makedirs(work, exist_ok=True)
+            rows = concat_parquets(local_shards, local_bunch)
+            _upsert_bunch(ledger, {
+                "index": idx,
+                "hub_path": hub_path,
+                "local_path": local_bunch,
+                "rows": rows,
+                "bytes": os.path.getsize(local_bunch),
+                "source_shards": sources,
+                "concatenated_at": _now(),
+                "uploaded_at": None,
+                "sources_deleted_at": None,
+            })
+            save_ledger(ledger_p, ledger)
+            log.info("bunch_%05d concatenated %d shards -> %d rows (%.1f MB)  [ledger]",
+                     idx, len(sources), rows, os.path.getsize(local_bunch) / 1e6)
+        else:
+            rows = int(existing.get("rows") or 0)
+            log.info("bunch_%05d concat already on disk — resume upload", idx)
+
+        log.info("uploading %s …", hub_path)
+        ops = [
+            CommitOperationAdd(path_in_repo=hub_path, path_or_fileobj=local_bunch),
+            CommitOperationAdd(path_in_repo=ledger_hub_path(config_name),
+                               path_or_fileobj=ledger_p),
+        ]
+        _commit_ops(api, repo, ops,
+                    f"{config_name}: bunch_{idx:05d} ({len(sources)} shards packed)")
+        existing = _bunch_entry(ledger, idx) or {}
+        _upsert_bunch(ledger, {**existing, "uploaded_at": _now()})
+        save_ledger(ledger_p, ledger)
         _commit_ops(
-            api, repo, chunk,
-            f"{config_name}: delete tiny shards {i + 1}-{i + len(chunk)}/{len(del_ops)}",
+            api, repo,
+            [CommitOperationAdd(path_in_repo=ledger_hub_path(config_name),
+                                path_or_fileobj=ledger_p)],
+            f"{config_name}: ledger uploaded bunch_{idx:05d}",
         )
-    log.info("deleted %d tiny %s shards from Hub", len(shards), config_name)
+        log.info("bunch_%05d ON HUB — originals still present until delete step", idx)
+
+        _, still = list_config_parquets(repo, config_name, token)
+        to_del = [s for s in sources if s in still]
+        del_ops = [CommitOperationDelete(path_in_repo=s) for s in to_del]
+        for i in range(0, len(del_ops), 200):
+            chunk = del_ops[i:i + 200]
+            _commit_ops(
+                api, repo, chunk,
+                f"{config_name}: delete shards for bunch_{idx:05d} "
+                f"({i + 1}-{i + len(chunk)}/{len(del_ops)})",
+            )
+        existing = _bunch_entry(ledger, idx) or {}
+        _upsert_bunch(ledger, {**existing, "sources_deleted_at": _now()})
+        save_ledger(ledger_p, ledger)
+        log.info("bunch_%05d source shards deleted from Hub  [ledger]", idx)
+
+        made_local.append({
+            "index": idx, "path": local_bunch, "rows": rows,
+            "sources": [os.path.basename(s) for s in sources],
+        })
+
+    if made_local:
+        _update_hub_state_after_compact(cfg, config_name, made_local, api, repo)
 
     if write_local:
-        local_files = download_many(repo, bunches, token) if bunches else []
-        local_files.extend(b["path"] for b in made)
-        write_local_dataset(cfg, config_name, local_files)
+        local_files = [b["path"] for b in made_local if os.path.isfile(b["path"])]
+        if not local_files:
+            hub_bunches, _ = list_config_parquets(repo, config_name, token)
+            local_files = download_many(repo, hub_bunches, token)
+        if local_files:
+            write_local_dataset(cfg, config_name, local_files)
 
-    for b in made:
-        try:
-            os.remove(b["path"])
-        except OSError:
-            pass
-    return {"config": config_name, "compacted": len(shards), "bunches": len(made)}
+    ledger["status"] = "done"
+    save_ledger(ledger_p, ledger)
+    _commit_ops(
+        api, repo,
+        [CommitOperationAdd(path_in_repo=ledger_hub_path(config_name),
+                            path_or_fileobj=ledger_p)],
+        f"{config_name}: compact ledger done",
+    )
+    log.info("compact DONE for %s — originals were only removed after each bunch landed",
+             config_name)
+    return {
+        "config": config_name,
+        "compacted": sum(len(p["source_shards"]) for p in ledger["plan"]),
+        "bunches": len(ledger["plan"]),
+    }
 
 
 def write_local_dataset(cfg, config_name: str, parquet_paths: list[str]) -> str:
@@ -362,25 +603,28 @@ def _update_hub_state_after_compact(cfg, config_name: str, made: list[dict],
         except (EntryNotFoundError, OSError, Exception):
             hub = {}
         done = sorted(set(st.get("audio_files_done", [])) | set(hub.get("audio_files_done", [])))
+        by_b: dict[int, dict] = {}
+        for src in (st.get("bunches") or [], hub.get("bunches") or []):
+            for b in src:
+                by_b[int(b["index"])] = dict(b)
+        for b in made:
+            by_b[int(b["index"])] = {
+                "index": b["index"],
+                "rows": b["rows"],
+                "hub_path": f"mimi/data/bunch_{b['index']:05d}.parquet",
+                "source_shards": b["sources"],
+            }
         nxt_bunch = max(
             int(st.get("next_bunch_index") or 0),
             int(hub.get("next_bunch_index") or 0),
-            next_bunch_index([f"bunch_{b['index']:05d}.parquet" for b in made]),
+            (max(by_b) + 1) if by_b else 0,
         )
         snap = {
             "audio_files_done": done,
             "next_mimi_index": 0,
             "next_bunch_index": nxt_bunch,
             "bunched": True,
-            "bunches": [
-                {
-                    "index": b["index"],
-                    "rows": b["rows"],
-                    "hub_path": f"mimi/data/bunch_{b['index']:05d}.parquet",
-                    "source_shards": b["sources"],
-                }
-                for b in made
-            ],
+            "bunches": [by_b[i] for i in sorted(by_b)],
         }
         os.makedirs(cfg.paths.mimi_dir, exist_ok=True)
         save_json(local, snap)
