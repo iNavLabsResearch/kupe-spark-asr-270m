@@ -9,7 +9,7 @@ import _bootstrap  # noqa: F401
 import argparse
 
 from kupe_asr.config import load_config
-from kupe_asr.data.encode import encode
+from kupe_asr.data.encode import encode, encode_status
 from kupe_asr.hf_utils import hf_login
 
 
@@ -18,6 +18,8 @@ def main():
     ap.add_argument("--config", default=None)
     ap.add_argument("--batch-max-frames", type=int, default=None)
     ap.add_argument("--no-push", action="store_true")
+    ap.add_argument("--status", action="store_true",
+                    help="print encode progress (done/left from encode_state.json) and exit")
     ap.add_argument(
         "--from-hub", action="store_true",
         help="download the `audio` config from Hub even if a local copy exists",
@@ -30,6 +32,9 @@ def main():
     if args.no_push:
         cfg.mimi.push = False
     hf_login()
+    if args.status:
+        encode_status(cfg)
+        return
     encode(cfg, from_hub=args.from_hub)
 
 

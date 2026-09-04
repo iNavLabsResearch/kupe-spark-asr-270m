@@ -68,6 +68,24 @@ def _load_state(cfg, token: str):
     return {"audio_files_done": sorted(done), "next_mimi_index": nxt}, local
 
 
+def encode_status(cfg) -> dict:
+    """Print how many audio parquet are encoded/uploaded vs left, from encode_state.json."""
+    token = require_token()
+    ensure_repo(cfg.repos.data, "dataset")
+    audio_files = _list_audio_files(cfg.repos.data, token)
+    state, _ = _load_state(cfg, token)
+    done = set(state["audio_files_done"])
+    todo = [f for f in audio_files if f not in done]
+    pct = 100.0 * len(done) / max(1, len(audio_files))
+    log.info("===== encode status =====")
+    log.info("audio parquet: %d total | %d encoded+uploaded (%.1f%%) | %d LEFT",
+             len(audio_files), len(done), pct, len(todo))
+    log.info("next up: %s", [os.path.basename(f) for f in todo[:5]] or "none — all done")
+    log.info("mimi shards written so far (next index): %d", int(state["next_mimi_index"]))
+    log.info("=========================")
+    return {"total": len(audio_files), "done": len(done), "left": len(todo)}
+
+
 def encode(cfg, *, from_hub: bool = True) -> str:
     import datasets
     import torch
