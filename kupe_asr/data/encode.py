@@ -88,13 +88,17 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     mimi = MimiModel.from_pretrained(cfg.mimi.model_id, token=hf_token()).to(device).eval()
     log.info("Mimi on %s (codebooks=%d, budget=%d frames, %d files/chunk)",
              device, n_cb, budget, files_per_chunk)
+    if device == "cpu":
+        log.warning("running encode on CPU — this is slow and RAM-heavy; run stage 2 on "
+                    "the GPU box (CUDA + more RAM). Big early audio shards can OOM here.")
 
     audio_files = _list_audio_files(cfg.repos.data, token)
     state, local_state = _load_state(cfg, token)
     done = set(state["audio_files_done"])
     todo = [f for f in audio_files if f not in done]
-    log.info("audio files: %d total, %d already encoded, %d to do",
-             len(audio_files), len(done), len(todo))
+    pct = 100.0 * len(done) / max(1, len(audio_files))
+    log.info("=== encode progress: %d/%d audio parquet done (%.1f%%), %d LEFT ===",
+             len(done), len(audio_files), pct, len(todo))
     if not todo:
         log.info("nothing to encode — mimi is up to date")
         return cfg.repos.data
@@ -170,9 +174,14 @@ def encode(cfg, *, from_hub: bool = True) -> str:
         log.info("uploaded %d mimi shard(s); local pending cleared", len(parts))
 
     processed = 0
+    total = len(audio_files)
+    base_done = len(done)
+    audio_cols = ["id", "language", "source", "text", "duration", "split", "audio"]
     import pyarrow.parquet as pq
 
     for af in tqdm(todo, desc="encode files", unit="file"):
+        cur = base_done + processed + 1
+        log.info("encoding %d/%d (%d left): %s", cur, total, total - cur, af)
         tmp = tempfile.mkdtemp(dir=dl_root)
         try:
             local = hf_hub_download(cfg.repos.data, af, repo_type="dataset",
@@ -181,7 +190,8 @@ def encode(cfg, *, from_hub: bool = True) -> str:
             arrays: list = []
             metas: list = []
             frames = 0
-            for b in pf.iter_batches(batch_size=32):
+            # small batch + column filter -> low peak RAM even on big early shards
+            for b in pf.iter_batches(batch_size=8, columns=audio_cols):
                 for rec in b.to_pylist():
                     try:
                         arr, sr = _decode_audio(rec.get("audio"))
@@ -205,8 +215,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
         save_json(local_state, state)
         processed += 1
 
-        # free memory + periodically flush+upload so disk stays bounded
-        try:
+        try:                               # return freed heap to the OS
             import ctypes
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception:
@@ -214,8 +223,12 @@ def encode(cfg, *, from_hub: bool = True) -> str:
         if processed % files_per_chunk == 0:
             flush_shard()
             upload_chunk()
+            log.info("=== encode progress: %d/%d done (%.1f%%), %d LEFT ===",
+                     base_done + processed, total,
+                     100.0 * (base_done + processed) / max(1, total), total - base_done - processed)
 
     flush_shard()
     upload_chunk()
-    log.info("encode done: %d audio files -> mimi config on %s", len(todo), cfg.repos.data)
+    log.info("encode DONE: %d/%d audio parquet encoded -> mimi on %s",
+             base_done + processed, total, cfg.repos.data)
     return cfg.repos.data
