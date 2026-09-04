@@ -353,7 +353,7 @@ def ensure_data_card(cfg) -> None:
     if existing:
         with open(existing, "r", encoding="utf-8") as f:
             text = f.read()
-        if "audio/data/*.parquet" in text:
+        if "audio/data/*.parquet" in text and "mimi/data/*.parquet" in text:
             return
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "README.md")

@@ -17,9 +17,23 @@ def is_dataset_dir(path: str) -> bool:
 
 def _load_hub(repo_id: str, config_name: str, token: str):
     from datasets import load_dataset
+    from huggingface_hub import HfApi
 
-    log.info("loading `%s` config from Hub %s (download to HF cache)", config_name, repo_id)
-    return load_dataset(repo_id, name=config_name, split="train", token=token)
+    # Files are `{audio,mimi}/data/*.parquet`. Do not use Hub YAML configs:
+    # a stale card globbed `mimi/*.parquet` (0 files) -> SchemaInferenceError.
+    prefix = f"{config_name}/data/"
+    files = [
+        p for p in HfApi(token=token).list_repo_files(repo_id, repo_type="dataset")
+        if p.startswith(prefix) and p.endswith(".parquet")
+    ]
+    if not files:
+        raise FileNotFoundError(f"{repo_id} has no parquet under {prefix}")
+    glob = f"hf://datasets/{repo_id}/{prefix}*.parquet"
+    log.info("loading `%s` from Hub %s (%d parquet under %s)",
+             config_name, repo_id, len(files), prefix)
+    return load_dataset(
+        "parquet", data_files={"train": glob}, split="train", token=token,
+    )
 
 
 def load_audio_dataset(cfg, *, from_hub: bool = False):
