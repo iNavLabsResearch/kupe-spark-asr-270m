@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 
 from ..hf_utils import log, require_token
-from .bunch import TINY_FILE_LIMIT, list_config_parquets, prefer_parquets
+from .bunch import TINY_FILE_LIMIT, dataset_from_parquets, list_config_parquets, prefer_parquets
 
 
 def is_dataset_dir(path: str) -> bool:
@@ -21,7 +21,6 @@ def is_dataset_dir(path: str) -> bool:
 
 
 def _load_hub(repo_id: str, config_name: str, token: str):
-    from datasets import load_dataset
     from huggingface_hub import snapshot_download
 
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -57,7 +56,7 @@ def _load_hub(repo_id: str, config_name: str, token: str):
         if not found:
             raise FileNotFoundError(f"snapshot missed {len(missing)} files, e.g. {missing[0]}")
         local_files = found
-    return load_dataset("parquet", data_files={"train": local_files}, split="train")
+    return dataset_from_parquets(local_files)
 
 
 def load_audio_dataset(cfg, *, from_hub: bool = False):

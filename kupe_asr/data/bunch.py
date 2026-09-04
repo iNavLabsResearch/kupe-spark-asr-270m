@@ -80,7 +80,11 @@ def prefer_parquets(bunches: list[str], shards: list[str]) -> list[str]:
 
 
 def concat_parquets(paths: list[str], out_path: str, *, batch_size: int = 1024) -> int:
-    """Stream-concat parquet files. Peak RAM ≈ one batch, not the whole bunch."""
+    """Stream-concat parquet files. Peak RAM ≈ one batch, not the whole bunch.
+
+    HuggingFace metadata is stripped: newer pyarrow writes Feature type `List`,
+    which older `datasets` cannot load (`Feature type 'List' not found`).
+    """
     import pyarrow.parquet as pq
 
     if not paths:
@@ -93,8 +97,9 @@ def concat_parquets(paths: list[str], out_path: str, *, batch_size: int = 1024) 
         for p in paths:
             pf = pq.ParquetFile(p)
             for batch in pf.iter_batches(batch_size=batch_size):
+                batch = batch.replace_schema_metadata(None)
                 if writer is None:
-                    schema = batch.schema
+                    schema = batch.schema.with_metadata(None)
                     writer = pq.ParquetWriter(out_path, schema, compression="zstd")
                 elif batch.schema != schema:
                     batch = batch.cast(schema)
@@ -106,6 +111,33 @@ def concat_parquets(paths: list[str], out_path: str, *, batch_size: int = 1024) 
     if writer is None:
         raise RuntimeError(f"concat_parquets: no rows in {len(paths)} files")
     return rows
+
+
+def dataset_from_parquets(parquet_paths: list[str]):
+    """Load parquet via pyarrow, ignoring HuggingFace `List` feature metadata.
+
+    `datasets.load_dataset('parquet')` reads stored Features and crashes on
+    older datasets: Feature type 'List' not found (wants Sequence).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from datasets import Dataset
+
+    if not parquet_paths:
+        raise ValueError("dataset_from_parquets: no files")
+    tables = [pq.read_table(p).replace_schema_metadata(None) for p in parquet_paths]
+    if len(tables) == 1:
+        table = tables[0]
+    else:
+        try:
+            table = pa.concat_tables(tables, promote_options="default")
+        except TypeError:
+            table = pa.concat_tables(tables)
+    table = table.replace_schema_metadata(None)
+    try:
+        return Dataset.from_arrow(table)
+    except AttributeError:
+        return Dataset(table)
 
 
 def group_paths(paths: list[str], *, bunch_size: int, bunch_max_bytes: int) -> list[list[str]]:
@@ -392,11 +424,26 @@ def compact_hub_config(
         for b in (ledger.get("bunches") or [])
     )
 
+    def _local_bunch_files() -> list[str]:
+        files = [b.get("local_path") for b in (ledger.get("bunches") or [])
+                 if b.get("local_path") and os.path.isfile(b["local_path"])]
+        if files:
+            return files
+        if os.path.isdir(work):
+            return sorted(
+                os.path.join(work, n) for n in os.listdir(work)
+                if n.startswith("bunch_") and n.endswith(".parquet")
+            )
+        return []
+
     if not leftover and not shards and not need_delete:
         log.info("nothing to compact for `%s` — already bunched or empty", config_name)
-        if write_local and bunches:
-            files = download_many(repo, bunches, token)
-            write_local_dataset(cfg, config_name, files)
+        if write_local:
+            files = _local_bunch_files() or (
+                download_many(repo, bunches, token) if bunches else []
+            )
+            if files:
+                write_local_dataset(cfg, config_name, files)
         ledger["status"] = "done"
         save_ledger(ledger_p, ledger)
         return {"config": config_name, "bunches": len(bunches), "compacted": 0}
@@ -407,10 +454,10 @@ def compact_hub_config(
     ):
         log.info("`%s` ledger already complete", config_name)
         if write_local:
-            hub_bunches, _ = list_config_parquets(repo, config_name, token)
-            files = [b.get("local_path") for b in (ledger.get("bunches") or [])
-                     if b.get("local_path") and os.path.isfile(b["local_path"])]
-            files = files or download_many(repo, hub_bunches, token)
+            files = _local_bunch_files()
+            if not files:
+                hub_bunches, _ = list_config_parquets(repo, config_name, token)
+                files = download_many(repo, hub_bunches, token)
             if files:
                 write_local_dataset(cfg, config_name, files)
         ledger["status"] = "done"
@@ -541,6 +588,8 @@ def compact_hub_config(
     if write_local:
         local_files = [b["path"] for b in made_local if os.path.isfile(b["path"])]
         if not local_files:
+            local_files = _local_bunch_files()
+        if not local_files:
             hub_bunches, _ = list_config_parquets(repo, config_name, token)
             local_files = download_many(repo, hub_bunches, token)
         if local_files:
@@ -565,11 +614,9 @@ def compact_hub_config(
 
 def write_local_dataset(cfg, config_name: str, parquet_paths: list[str]) -> str:
     """Materialize a `save_to_disk` dataset so train skips the Hub entirely."""
-    from datasets import load_dataset
-
     dest = os.path.join(getattr(cfg.paths, f"{config_name}_dir"), "dataset")
     log.info("writing local %s dataset (%d parquet) -> %s", config_name, len(parquet_paths), dest)
-    ds = load_dataset("parquet", data_files={"train": parquet_paths}, split="train")
+    ds = dataset_from_parquets(parquet_paths)
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     if os.path.isdir(dest):
         shutil.rmtree(dest)
