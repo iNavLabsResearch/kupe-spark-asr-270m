@@ -36,6 +36,7 @@ def empty_lang() -> dict:
         "n_clips": 0,
         "by_source": {},
         "next_clip_index": 0,
+        "files_done": {},             # source -> parquet files fully consumed (resume point)
     }
 
 

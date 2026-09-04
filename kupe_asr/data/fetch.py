@@ -203,11 +203,12 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
         st["status"] = "in_progress"
         persist_state(cfg, state, seen)
 
+        files_done = dict(st.get("files_done") or {})
         iters = []
         for src in sources_for(lang):
             try:
-                nskip = int(by_src.get(src.name, 0))
-                iters.append([src.name, iter_examples(src, lang, token, skip=nskip)])
+                sf0 = int(files_done.get(src.name, 0))
+                iters.append([src.name, iter_examples(src, lang, token, start_file=sf0)])
                 by_src.setdefault(src.name, 0)
             except SkipSource as e:
                 log.warning("skip %s/%s: %s", src.name, lang, e)
@@ -229,12 +230,18 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
                     break
                 name, it = entry
                 try:
-                    array, sr, text = next(it)
+                    array, sr, text, file_idx = next(it)
                 except StopIteration:
                     active.remove(entry)
                     continue
                 except Exception as e:
                     log.debug("next() error %s/%s: %s", name, lang, e)
+                    continue
+
+                if array is None:            # a parquet file finished -> save resume point
+                    files_done[name] = int(file_idx)
+                    st["files_done"] = files_done
+                    persist_state(cfg, state, seen)
                     continue
 
                 if not is_probably_valid(text):
@@ -286,6 +293,7 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
         st["n_clips"] = int(st.get("n_clips") or 0)
         st["next_clip_index"] = n
         st["by_source"] = by_src
+        st["files_done"] = files_done
         st["status"] = "done" if got_s >= cap_s or not active else "in_progress"
         persist_state(cfg, state, seen)
         log.info("lang %s: kept %.1f h (%d clips, %.1f min val) | by source: %s | %s",
