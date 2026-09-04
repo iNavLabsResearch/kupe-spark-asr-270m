@@ -33,9 +33,10 @@ data:
   min_dur: 1.0            # drop clips shorter than this (seconds)
   max_dur: 20.0           # drop clips longer than this (seconds)
   val_minutes_per_lang: 20
-  shard_size: 500         # rows per parquet (~150-180MB). Sources drained one at a
-                          # time + downloads go to disk, so RAM stays flat. Raise to
-                          # 1000-2000 for bigger/fewer files if RAM >= 8GB.
+  shard_size: 2000        # rows per parquet (~600MB). Bigger = fewer files; ONLY limited
+                          # by flush RAM (writer buffers a whole shard: ~0.3MB/row peak).
+                          # Does NOT affect encode/train (both glob all parquet). Drop to
+                          # 1000/500 only if the fetch box has < ~4GB RAM and OOMs.
   streaming: true
   num_proc: 8
   push: true              # 01 collects shards locally, uploads in batches; resume via fetch_state.json
