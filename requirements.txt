@@ -2,7 +2,7 @@
 # Install torch FIRST, matched to your CUDA (see README). Example:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu124
 torch>=2.3
-transformers>=4.56.0      # Gemma-3 + Mimi + eval_strategy
+transformers>=4.56.0,<5   # Gemma-3 + Mimi; <5 so it runs on torch 2.4.x (v5 needs torch>=2.5)
 datasets>=2.20.0,<4.0.0   # streaming + push_to_hub(config_name=...)
 accelerate>=0.33.0
 huggingface_hub>=0.24.0
