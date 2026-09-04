@@ -75,6 +75,9 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     from transformers import AutoFeatureExtractor, MimiModel
 
     datasets.utils.logging.set_verbosity_error()
+    # Xet reconstruction buffers the whole file in RAM and OOMs small boxes on big
+    # shards; plain HTTP streams to disk. Opt back in by exporting HF_HUB_DISABLE_XET=0.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
     token = require_token()
     ensure_repo(cfg.repos.data, "dataset")
