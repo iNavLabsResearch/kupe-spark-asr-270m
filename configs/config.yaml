@@ -83,13 +83,18 @@ train:
   p_auto: 0.5              # fraction of examples trained in auto-language mode
   logging_steps: 20
   eval_steps: 500
-  save_steps: 1000         # also pushes a resumable checkpoint to the runs repo each save
+  save_steps: 500          # aligned with eval so load_best_model_at_end works
   save_total_limit: 3
   gradient_checkpointing: false
   num_workers: 8
   bf16: true
+  # --- production regularization / smart training ---
+  max_grad_norm: 1.0         # gradient clipping (grad_norm was 30-155 early -> clip helps)
+  label_smoothing: 0.0       # 0.05-0.1 improves prob calibration (helps eos flags); 0 keeps sharp WER
+  early_stopping_patience: 4 # stop if eval_loss doesn't improve for N evals (saves GPU $)
   push_to_hub: true        # push run folder (weights+reports) to the runs repo
   push_checkpoints: true   # push last checkpoint to runs/<run>/last_checkpoint (resume anywhere)
+  hub_ckpt_every: 2000     # throttle Hub checkpoint pushes (local saves stay every save_steps)
 
 eval:
   max_samples_per_lang: 300

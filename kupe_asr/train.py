@@ -26,12 +26,15 @@ class HubCheckpointCallback(TrainerCallback):
     """Push the latest checkpoint (weights + optimizer) to runs/<run>/last_checkpoint
     each save, so any box can resume/extend the run from the Hub."""
 
-    def __init__(self, cfg, run_name):
+    def __init__(self, cfg, run_name, every=2000):
         self.cfg = cfg
         self.run_name = run_name
+        self.every = max(1, int(every))
 
     def on_save(self, args, state, control, **kwargs):
         if not state.is_world_process_zero:
+            return control
+        if state.global_step % self.every != 0:   # throttle Hub pushes (local saves stay)
             return control
         ckpt = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
         if not os.path.isdir(ckpt):
@@ -137,17 +140,22 @@ def _training_args(cfg, out_dir, run_name, use_wandb, *, overwrite: bool):
         bf16=bool(cfg.train.bf16),
         tf32=True,                          # Ampere+ matmul speedup (H100/4090/PRO6000)
         optim="adamw_torch_fused",          # fused AdamW -> faster, less overhead
+        max_grad_norm=float(getattr(cfg.train, "max_grad_norm", 1.0)),
+        label_smoothing_factor=float(getattr(cfg.train, "label_smoothing", 0.0)),
         gradient_checkpointing=bool(cfg.train.gradient_checkpointing),
         group_by_length=True,               # batch similar lengths -> less padding, full GPU
         length_column_name="num_frames",
         logging_steps=cfg.train.logging_steps,
         eval_strategy="steps",
         eval_steps=cfg.train.eval_steps,
-        prediction_loss_only=True,          # never gather 258k-vocab logits (OOM); WER via callback
+        prediction_loss_only=True,          # never gather 264k-vocab logits (OOM); WER via callback
         save_strategy="steps",
         save_steps=cfg.train.save_steps,
         save_total_limit=cfg.train.save_total_limit,
         save_safetensors=True,
+        load_best_model_at_end=True,        # final model = best eval_loss, not last step
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         dataloader_num_workers=cfg.train.num_workers,
         dataloader_pin_memory=True,
         report_to=["wandb"] if use_wandb else ["none"],
@@ -196,9 +204,14 @@ def train(cfg, *, from_hub: bool = False, resume: str | None = None) -> str:
     collator = AsrCollator(builder, tmap, cfg.train.p_auto, cfg.seed)
 
     args = _training_args(cfg, out_dir, run_name, use_wandb, overwrite=overwrite)
-    callbacks = [WerCallback(model, tok, tmap, val_ds, cfg)]
+    from transformers import EarlyStoppingCallback
+    callbacks = [
+        WerCallback(model, tok, tmap, val_ds, cfg),
+        EarlyStoppingCallback(early_stopping_patience=int(getattr(cfg.train, "early_stopping_patience", 4))),
+    ]
     if bool(getattr(cfg.train, "push_checkpoints", True)):
-        callbacks.append(HubCheckpointCallback(cfg, run_name))
+        callbacks.append(HubCheckpointCallback(cfg, run_name,
+                                               every=int(getattr(cfg.train, "hub_ckpt_every", 2000))))
     trainer = Trainer(
         model=model, args=args,
         train_dataset=train_ds, eval_dataset=val_ds,
