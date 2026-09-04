@@ -11,6 +11,7 @@ Resume: `mimi/encode_state.json` records which audio files are already encoded.
 """
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import shutil
@@ -77,8 +78,15 @@ def encode(cfg, *, from_hub: bool = True) -> str:
 
     token = require_token()
     ensure_repo(cfg.repos.data, "dataset")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    autocast_dtype = torch.float16 if device == "cuda" else torch.float32
+    # works on any backend: CUDA (4090/L4/H100/RTX PRO 6000/...), Apple MPS, or CPU
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+    use_autocast = device == "cuda"                       # fp16 autocast only on CUDA
+    autocast_dtype = torch.float16 if use_autocast else torch.float32
     n_cb = int(cfg.mimi.num_codebooks)
     budget = int(cfg.mimi.batch_max_frames)
     shard_size = int(cfg.data.shard_size)
@@ -127,18 +135,40 @@ def encode(cfg, *, from_hub: bool = True) -> str:
         mimi_idx += 1
         buf = []
 
-    def encode_batch(arrays, metas):
-        if not arrays:
-            return
+    def _forward(arrays):
         inputs = fe(raw_audio=arrays, sampling_rate=MIMI_SAMPLE_RATE,
                     return_tensors="pt", padding=True)
         iv = inputs["input_values"].to(device)
         pm = inputs.get("padding_mask")
         pm = pm.to(device) if pm is not None else None
-        with torch.no_grad(), torch.autocast(device_type=device.split(":")[0],
-                                             dtype=autocast_dtype, enabled=(device == "cuda")):
+        ac = torch.autocast(device_type="cuda", dtype=autocast_dtype) if use_autocast \
+            else contextlib.nullcontext()
+        with torch.no_grad(), ac:
             out = mimi.encode(iv, pm, num_quantizers=n_cb)
-        codes = out.audio_codes[:, 0, :].to("cpu").numpy()
+        return out.audio_codes[:, 0, :].to("cpu").numpy()
+
+    def _is_oom(e: Exception) -> bool:
+        return isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+
+    def encode_batch(arrays, metas):
+        # VRAM-adaptive: on OOM, split the batch and retry so it fits any GPU size.
+        if not arrays:
+            return
+        try:
+            codes = _forward(arrays)
+        except Exception as e:
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            if _is_oom(e) and len(arrays) > 1:
+                mid = len(arrays) // 2
+                encode_batch(arrays[:mid], metas[:mid])
+                encode_batch(arrays[mid:], metas[mid:])
+                return
+            if _is_oom(e) and len(arrays) == 1:
+                log.warning("skipping 1 clip that OOMs alone (%.1fs) — raise a bigger GPU",
+                            float(metas[0].get("duration", 0)))
+                return
+            raise
         for j, r in enumerate(metas):
             nf = min(codes.shape[1], frames_of(r["duration"]))
             buf.append({
