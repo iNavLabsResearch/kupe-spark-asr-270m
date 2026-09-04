@@ -52,8 +52,8 @@ mimi:
   files_per_chunk: 5      # audio parquet files to download+encode before each mimi upload;
                           # smaller = less local disk held, more commits. Encoded shards +
                           # downloaded audio are deleted after each chunk.
-  prefetch: 4             # audio files to keep downloaded ahead (pipeline). ~1.3GB each,
-                          # so 4 ≈ 5GB disk. Raise on big disk (300GB) for deeper overlap.
+  prefetch: 16            # audio files to keep downloaded ahead (pipeline). ~1.3GB each,
+                          # so 16 ≈ 20GB disk. Raise more on big disk for deeper overlap.
   push: true              # push `mimi` config after encoding
 
 model:
