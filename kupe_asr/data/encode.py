@@ -96,6 +96,8 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     # Xet reconstruction buffers the whole file in RAM and OOMs small boxes on big
     # shards; plain HTTP streams to disk. Opt back in by exporting HF_HUB_DISABLE_XET=0.
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    # reduce CUDA fragmentation OOMs (works with the per-batch OOM auto-split below)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     token = require_token()
     ensure_repo(cfg.repos.data, "dataset")
@@ -143,6 +145,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
 
     buf: list[dict] = []
     mimi_idx = int(state["next_mimi_index"])
+    chunk_files: list[str] = []          # mimi shard filenames written since last upload
 
     def flush_shard():
         nonlocal buf, mimi_idx
@@ -152,6 +155,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
 
         path = os.path.join(pending, f"shard_{mimi_idx:05d}.parquet")
         Dataset.from_list(buf, features=_features()).to_parquet(path)
+        chunk_files.append(os.path.basename(path))
         log.info("wrote %s (%d rows)", os.path.basename(path), len(buf))
         mimi_idx += 1
         buf = []
@@ -219,28 +223,56 @@ def encode(cfg, *, from_hub: bool = True) -> str:
                 if len(buf) >= shard_size:
                     flush_shard()
 
-    def upload_chunk():
-        """Commit all pending mimi shards + resume state in ONE commit, then clear disk."""
+    # --- background uploader: encoding never blocks on Hub commits ---
+    up_pool = ThreadPoolExecutor(max_workers=1)   # serialize commits
+    inflight: list = []
+    max_inflight = 2                              # bound disk to ~2 chunks
+
+    def _do_upload(files, snap):
+        if not files:
+            return
         if not cfg.mimi.push:
-            log.info("mimi shards kept local (--no-push): %s", pending)
-            save_json(local_state, state)
+            log.info("[bg] mimi shards kept local (--no-push)")
             return
-        parts = sorted(f for f in os.listdir(pending) if f.endswith(".parquet"))
-        save_json(local_state, state)
-        ops = [CommitOperationAdd(f"{HUB_MIMI_DIR}/{f}", os.path.join(pending, f)) for f in parts]
-        ops.append(CommitOperationAdd(HUB_MIMI_STATE, local_state))
-        if not ops:
-            return
+        tmp_state = os.path.join(cfg.paths.mimi_dir, f".state_{files[0]}.json")
+        save_json(tmp_state, snap)
+        ops = [CommitOperationAdd(f"{HUB_MIMI_DIR}/{f}", os.path.join(pending, f)) for f in files]
+        ops.append(CommitOperationAdd(HUB_MIMI_STATE, tmp_state))
         _commit_with_backoff(
             lambda: api.create_commit(repo_id=cfg.repos.data, repo_type="dataset",
-                                      operations=ops,
-                                      commit_message=f"mimi: +{len(parts)} shards"),
+                                      operations=ops, commit_message=f"mimi: +{len(files)} shards"),
             "mimi commit",
         )
-        for f in parts:
-            os.remove(os.path.join(pending, f))
-        ensure_data_card(cfg)          # make sure the `mimi` config is declared
-        log.info("uploaded %d mimi shard(s); local pending cleared", len(parts))
+        for f in files:                          # delete only THIS chunk's files
+            try:
+                os.remove(os.path.join(pending, f))
+            except OSError:
+                pass
+        try:
+            os.remove(tmp_state)
+        except OSError:
+            pass
+        ensure_data_card(cfg)
+        log.info("[bg] uploaded %d mimi shard(s); local cleared", len(files))
+
+    def submit_upload():
+        nonlocal chunk_files
+        if not chunk_files:
+            return
+        files, chunk_files = chunk_files, []
+        snap = {"audio_files_done": list(state["audio_files_done"]),
+                "next_mimi_index": int(mimi_idx)}
+        inflight.append(up_pool.submit(_do_upload, files, snap))
+        inflight[:] = [f for f in inflight if not f.done()]
+        while len(inflight) > max_inflight:      # backpressure: keep disk bounded
+            inflight.pop(0).result()
+
+    processed = 0
+    total = len(audio_files)
+    base_done = len(done)
+    audio_cols = ["id", "language", "source", "text", "duration", "split", "audio"]
+    import pyarrow.parquet as pq
+
 
     processed = 0
     total = len(audio_files)
@@ -288,6 +320,8 @@ def encode(cfg, *, from_hub: bool = True) -> str:
         save_json(local_state, state)
         processed += 1
 
+        if devices[0].startswith("cuda"):
+            torch.cuda.empty_cache()       # keep VRAM defragmented between files
         try:                               # return freed heap to the OS
             import ctypes
             ctypes.CDLL("libc.so.6").malloc_trim(0)
@@ -295,13 +329,17 @@ def encode(cfg, *, from_hub: bool = True) -> str:
             pass
         if processed % files_per_chunk == 0:
             flush_shard()
-            upload_chunk()
-            log.info("=== encode progress: %d/%d done (%.1f%%), %d LEFT ===",
+            submit_upload()                # upload + delete in the BACKGROUND; encoding continues
+            log.info("=== encode progress: %d/%d done (%.1f%%), %d LEFT (upload in bg) ===",
                      base_done + processed, total,
                      100.0 * (base_done + processed) / max(1, total), total - base_done - processed)
 
     flush_shard()
-    upload_chunk()
+    submit_upload()
+    log.info("waiting for background uploads to finish…")
+    for f in inflight:                     # drain remaining bg uploads
+        f.result()
+    up_pool.shutdown(wait=True)
     pool.shutdown(wait=True)
     log.info("encode DONE: %d/%d audio parquet encoded -> mimi on %s",
              base_done + processed, total, cfg.repos.data)
