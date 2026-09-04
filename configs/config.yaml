@@ -38,7 +38,10 @@ data:
                           # 1000-2000 for bigger/fewer files if RAM >= 8GB.
   streaming: true
   num_proc: 8
-  push: true              # 01 uploads each shard to Hub as it is written; resume via fetch_state.json
+  push: true              # 01 collects shards locally, uploads in batches; resume via fetch_state.json
+  commit_batch: 25        # shards per Hub commit. HF caps 128 commits/hour, so batch to
+                          # stay well under it. Higher = fewer commits but more local disk
+                          # held before upload (~batch * shard_size * 0.3MB). Lower if disk tight.
 
 mimi:
   model_id: kyutai/mimi

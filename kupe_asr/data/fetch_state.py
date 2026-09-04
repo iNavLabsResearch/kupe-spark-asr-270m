@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import tempfile
+import time
 from datetime import datetime, timezone
 
 from ..constants import LANGUAGES
@@ -441,6 +443,61 @@ def arrow_to_parquet(arrow_dir: str, parquet_path: str) -> int:
     os.makedirs(os.path.dirname(parquet_path) or ".", exist_ok=True)
     ds.to_parquet(parquet_path)
     return ds.num_rows
+
+
+def stage_shard(cfg, arrow_dir: str, idx: int, *, drop_local: bool) -> tuple[str, int]:
+    """Convert one arrow shard to parquet on local disk (no Hub commit yet)."""
+    parquet_path = os.path.join(cfg.paths.audio_dir, "parquet_tmp", f"shard_{idx:05d}.parquet")
+    rows = arrow_to_parquet(arrow_dir, parquet_path)
+    if drop_local:
+        shutil.rmtree(arrow_dir, ignore_errors=True)
+    return parquet_path, rows
+
+
+def commit_batch(cfg, state: dict, seen: set[str], staged: list[tuple[int, str, int]]) -> None:
+    """Upload MANY staged parquet shards + resume state in ONE Hub commit.
+
+    Batching keeps us far under the Hub's 128-commits/hour limit. On 429 we back
+    off with increasing sleeps; a final failure raises so resume retries later.
+    """
+    from huggingface_hub import CommitOperationAdd, HfApi
+
+    if not staged:
+        return
+    persist_state(cfg, state, seen)
+    local_state_path, local_fps_path = local_paths(cfg.paths.audio_dir)
+    ops = [CommitOperationAdd(path_in_repo=f"{HUB_SHARD_DIR}/shard_{idx:05d}.parquet",
+                              path_or_fileobj=p) for idx, p, _ in staged]
+    ops.append(CommitOperationAdd(path_in_repo=HUB_STATE, path_or_fileobj=local_state_path))
+    ops.append(CommitOperationAdd(path_in_repo=HUB_FPS, path_or_fileobj=local_fps_path))
+
+    api = HfApi(token=require_token())
+    lo, hi = staged[0][0], staged[-1][0]
+    msg = f"audio shards {lo:05d}..{hi:05d} ({len(staged)} files)"
+    delays = [0, 30, 120, 300, 900, 1800]
+    for attempt, delay in enumerate(delays):
+        if delay:
+            log.warning("commit backoff %ds (attempt %d/%d)…", delay, attempt + 1, len(delays))
+            time.sleep(delay)
+        try:
+            api.create_commit(repo_id=cfg.repos.data, repo_type="dataset",
+                              operations=ops, commit_message=msg)
+            break
+        except Exception as e:
+            rate = "429" in str(e) or "Too Many Requests" in str(e)
+            log.warning("batch commit failed%s: %s", " (rate-limited)" if rate else "", e)
+            if attempt == len(delays) - 1:
+                raise RuntimeError(f"commit_batch {msg} failed after retries") from e
+
+    for idx, p, rows in staged:
+        upsert_shard(state, idx, rows, uploaded=True)
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    persist_state(cfg, state, seen)
+    log.info("HUB COMMIT ok: %d shards (%05d..%05d) -> %s", len(staged), lo, hi, cfg.repos.data)
+    log.info("resume  %s", format_progress(state, cfg.data.max_hours_per_lang))
 
 
 def upload_arrow_shard(cfg, state: dict, seen: set[str], idx: int, arrow_dir: str,

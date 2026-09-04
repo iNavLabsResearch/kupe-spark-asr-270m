@@ -33,6 +33,7 @@ from ..hf_utils import ensure_repo, log, require_token
 from ..text import is_probably_valid, normalize
 from .fetch_state import (
     clip_fp,
+    commit_batch,
     empty_lang,
     ensure_data_card,
     ingest_local_shard,
@@ -40,6 +41,7 @@ from .fetch_state import (
     load_merged_state,
     persist_state,
     print_status,
+    stage_shard,
     upload_arrow_shard,
     upsert_shard,
 )
@@ -122,6 +124,45 @@ def _index_and_upload_local(cfg, state: dict, seen: set[str], hub_indices: set[i
     persist_state(cfg, state, seen)
 
 
+def _recover_parquet_tmp(cfg, state, seen, hub_indices, batch_n) -> None:
+    """Commit parquet shards staged locally but not committed before a crash."""
+    import pyarrow.parquet as pq
+
+    tmp_dir = os.path.join(cfg.paths.audio_dir, "parquet_tmp")
+    if not os.path.isdir(tmp_dir):
+        return
+    staged: list[tuple[int, str, int]] = []
+    for name in sorted(os.listdir(tmp_dir)):
+        if not (name.startswith("shard_") and name.endswith(".parquet")):
+            continue
+        try:
+            idx = int(name[len("shard_"):-len(".parquet")])
+        except ValueError:
+            continue
+        path = os.path.join(tmp_dir, name)
+        if idx in hub_indices:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        try:
+            rows = pq.ParquetFile(path).metadata.num_rows
+        except Exception:
+            continue
+        staged.append((idx, path, rows))
+        if len(staged) >= batch_n:
+            commit_batch(cfg, state, seen, staged)
+            for i, _, _ in staged:
+                hub_indices.add(i)
+            staged.clear()
+    if staged:
+        log.info("recovering %d staged shard(s) from a previous run", len(staged))
+        commit_batch(cfg, state, seen, staged)
+        for i, _, _ in staged:
+            hub_indices.add(i)
+
+
 def fetch_status(cfg, *, reset: bool = False) -> dict:
     token = require_token()
     ensure_repo(cfg.repos.data, "dataset")
@@ -159,6 +200,9 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
         cfg, state, seen, hub_indices, shards_dir,
         push=bool(cfg.data.push), hub_only=hub_only,
     )
+    if cfg.data.push:
+        _recover_parquet_tmp(cfg, state, seen, hub_indices,
+                             int(getattr(cfg.data, "commit_batch", 25)))
     print_status(state, cfg.data.max_hours_per_lang, hub_indices)
 
     start_index = int(state.get("next_shard_index") or 0)
@@ -167,14 +211,28 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
     if hub_indices:
         start_index = max(start_index, max(hub_indices) + 1)
 
+    # Collect several shards locally, then upload them in ONE Hub commit.
+    # HF caps commits at 128/hour; one-commit-per-shard hits 429 fast.
+    staged: list[tuple[int, str, int]] = []
+    batch_n = int(getattr(cfg.data, "commit_batch", 25))
+
+    def flush_staged(force: bool = False) -> None:
+        if staged and (force or len(staged) >= batch_n):
+            commit_batch(cfg, state, seen, staged)
+            for idx, _, _ in staged:
+                hub_indices.add(idx)
+            staged.clear()
+
     def on_flush(arrow_dir: str, idx: int, nrows: int) -> None:
         upsert_shard(state, idx, nrows, uploaded=False)
         persist_state(cfg, state, seen)
         if not cfg.data.push:
             log.info("shard_%05d saved locally (%d rows) — not uploaded (--no-push)", idx, nrows)
             return
-        upload_arrow_shard(cfg, state, seen, idx, arrow_dir, drop_local=hub_only)
-        hub_indices.add(idx)
+        pq_path, rows = stage_shard(cfg, arrow_dir, idx, drop_local=hub_only)
+        staged.append((idx, pq_path, rows))
+        log.info("staged shard_%05d (%d rows) — %d/%d before next commit", idx, rows, len(staged), batch_n)
+        flush_staged()
         _free_memory()          # keep RSS flat across many shards
 
     writer = ShardWriter(
@@ -301,6 +359,7 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
             log.warning("lang %s produced 0 clips — check gate/access for its sources", lang)
 
     writer.close()
+    flush_staged(force=True)          # upload any remaining staged shards in one commit
     local_state, local_fps = persist_state(cfg, state, seen)
     if cfg.data.push:
         from huggingface_hub import CommitOperationAdd, HfApi
