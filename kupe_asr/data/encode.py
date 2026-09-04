@@ -83,9 +83,14 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     from concurrent.futures import ThreadPoolExecutor
     from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
 
+    import time
+
+    from huggingface_hub.utils import disable_progress_bars as _hf_no_bars
+
     datasets.utils.logging.set_verbosity_error()
     datasets.disable_progress_bars()                       # quiet "Creating parquet…" bars
-    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")   # quiet per-file DL bars
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    _hf_no_bars()                                          # kill HF download/upload bars
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")            # stream DL to disk (low RAM)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -281,11 +286,27 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     threading.Thread(target=downloader, daemon=True).start()
     threading.Thread(target=decoder, daemon=True).start()
 
-    # ---- GPU consumer (main) --------------------------------------------
+    # ---- GPU consumer (main): one compact status line, no bars ----------
     processed = 0
     hours_done = 0.0
-    pbar = tqdm(total=len(todo), unit="file", desc="encode",
-                bar_format="{l_bar}{bar}| {n}/{total} files [{elapsed}<{remaining}] {postfix}")
+    t0 = time.time()
+    last = 0.0
+
+    def status(force=False):
+        nonlocal last
+        now = time.time()
+        if not force and now - last < 3:
+            return
+        last = now
+        el = max(1e-6, now - t0)
+        fpm = processed / (el / 60)
+        left = len(todo) - processed
+        eta_h = (left / fpm / 60) if fpm else 0.0
+        est_left_h = (hours_done / processed * left) if processed else 0.0
+        log.info("progress: %d/%d files done | %d LEFT | %.1f h encoded (~%.0f h left) | "
+                 "%.1f files/min | ETA %.1f h",
+                 base + processed, total, left, hours_done, est_left_h, fpm, eta_h)
+
     while True:
         item = batchq.get()
         if item is _DONE:
@@ -294,6 +315,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
             _, arrays, metas = item
             gpu_encode(arrays, metas)
             hours_done += sum(m["duration"] for m in metas) / 3600.0
+            status()
         else:  # file finished
             state["audio_files_done"] = sorted(set(state["audio_files_done"]) | {item[1]})
             state["next_mimi_index"] = mimi_idx
@@ -304,11 +326,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
             if processed % files_per_chunk == 0:
                 flush_shard()
                 submit_upload()
-            eta_h = (hours_done / processed) * (len(todo) - processed) if processed else 0.0
-            pbar.update(1)
-            pbar.set_postfix_str(f"{hours_done:.1f}h enc · ~{eta_h:.0f}h left · {len(todo)-processed} files")
-
-    pbar.close()
+            status(force=True)
     flush_shard()
     submit_upload()
     for f in inflight:
