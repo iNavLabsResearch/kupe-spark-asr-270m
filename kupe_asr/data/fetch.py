@@ -39,10 +39,13 @@ from .fetch_state import (
     ingest_local_shard,
     list_local_shards,
     load_merged_state,
+    pending_dir,
     persist_state,
     print_status,
     stage_shard,
+    stage_to_pending,
     upload_arrow_shard,
+    upload_pending,
     upsert_shard,
 )
 from .shards import ShardWriter, wav_bytes
@@ -163,6 +166,17 @@ def _recover_parquet_tmp(cfg, state, seen, hub_indices, batch_n) -> None:
             hub_indices.add(i)
 
 
+def _migrate_tmp_to_pending(cfg) -> None:
+    """Move any parquet staged in parquet_tmp into pending/ (defer-upload mode)."""
+    tmp_dir = os.path.join(cfg.paths.audio_dir, "parquet_tmp")
+    if not os.path.isdir(tmp_dir):
+        return
+    dest = pending_dir(cfg)
+    for name in sorted(os.listdir(tmp_dir)):
+        if name.endswith(".parquet"):
+            shutil.move(os.path.join(tmp_dir, name), os.path.join(dest, name))
+
+
 def fetch_status(cfg, *, reset: bool = False) -> dict:
     token = require_token()
     ensure_repo(cfg.repos.data, "dataset")
@@ -177,7 +191,18 @@ def fetch_status(cfg, *, reset: bool = False) -> dict:
     return state
 
 
-def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
+def upload_only(cfg) -> int:
+    """Bulk-upload everything collected locally under pending/ in ONE folder commit."""
+    require_token()
+    ensure_repo(cfg.repos.data, "dataset")
+    ensure_data_card(cfg)
+    state, seen, _ = load_merged_state(cfg)
+    n = upload_pending(cfg, state, seen)
+    log.info("upload-only done: %d shard(s) sent", n)
+    return n
+
+
+def fetch(cfg, *, hub_only: bool = False, reset: bool = False, defer_upload: bool = False) -> str:
     import datasets
 
     datasets.utils.logging.set_verbosity_error()
@@ -188,8 +213,8 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
         raise RuntimeError("--hub-only needs data.push=true; do not pass --no-push")
 
     ensure_repo(cfg.repos.data, "dataset")
-    if cfg.data.push:
-        ensure_data_card(cfg)
+    if cfg.data.push and not defer_upload:
+        ensure_data_card(cfg)          # ensure_data_card is a commit; skip while deferring
 
     target_sr = int(cfg.data.target_sr) if hasattr(cfg.data, "target_sr") else MIMI_SAMPLE_RATE
     shards_dir = os.path.join(cfg.paths.audio_dir, "shards")
@@ -200,7 +225,9 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
         cfg, state, seen, hub_indices, shards_dir,
         push=bool(cfg.data.push), hub_only=hub_only,
     )
-    if cfg.data.push:
+    if defer_upload:
+        _migrate_tmp_to_pending(cfg)   # any staged parquet -> pending (no commit)
+    elif cfg.data.push:
         _recover_parquet_tmp(cfg, state, seen, hub_indices,
                              int(getattr(cfg.data, "commit_batch", 25)))
     print_status(state, cfg.data.max_hours_per_lang, hub_indices)
@@ -228,6 +255,11 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
         persist_state(cfg, state, seen)
         if not cfg.data.push:
             log.info("shard_%05d saved locally (%d rows) — not uploaded (--no-push)", idx, nrows)
+            return
+        if defer_upload:            # collect locally now, upload later in one commit
+            stage_to_pending(cfg, arrow_dir, idx, drop_local=True)
+            log.info("shard_%05d (%d rows) -> pending/ (upload later with --upload-only)", idx, nrows)
+            _free_memory()
             return
         pq_path, rows = stage_shard(cfg, arrow_dir, idx, drop_local=hub_only)
         staged.append((idx, pq_path, rows))
@@ -359,9 +391,14 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
             log.warning("lang %s produced 0 clips — check gate/access for its sources", lang)
 
     writer.close()
-    flush_staged(force=True)          # upload any remaining staged shards in one commit
+    if not defer_upload:
+        flush_staged(force=True)      # upload any remaining staged shards in one commit
     local_state, local_fps = persist_state(cfg, state, seen)
-    if cfg.data.push:
+    if defer_upload:
+        n_pend = len([f for f in os.listdir(pending_dir(cfg)) if f.endswith(".parquet")])
+        log.info("fetch (defer) done | %d shard(s) in pending/ — run: "
+                 "python scripts/01_fetch_data.py --upload-only", n_pend)
+    if cfg.data.push and not defer_upload:
         from huggingface_hub import CommitOperationAdd, HfApi
         try:
             HfApi(token=token).create_commit(

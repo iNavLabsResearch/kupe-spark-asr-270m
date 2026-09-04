@@ -16,6 +16,14 @@ fetch-status:
 fetch-hub:
 	python scripts/01_fetch_data.py --hub-only
 
+# download only, ZERO Hub commits (never rate-limited); parquet collects in pending/
+fetch-defer:
+	python scripts/01_fetch_data.py --defer-upload
+
+# send everything in pending/ to the Hub in ONE folder commit
+upload:
+	python scripts/01_fetch_data.py --upload-only
+
 encode:
 	python scripts/02_encode_data.py
 

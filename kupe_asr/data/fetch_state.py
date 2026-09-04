@@ -445,6 +445,77 @@ def arrow_to_parquet(arrow_dir: str, parquet_path: str) -> int:
     return ds.num_rows
 
 
+def pending_dir(cfg) -> str:
+    d = os.path.join(cfg.paths.audio_dir, "pending")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def stage_to_pending(cfg, arrow_dir: str, idx: int, *, drop_local: bool) -> tuple[str, int]:
+    """Convert a shard to parquet and move it to the local pending/ dir (no Hub commit)."""
+    pq_path, rows = stage_shard(cfg, arrow_dir, idx, drop_local=drop_local)
+    dest = os.path.join(pending_dir(cfg), f"shard_{idx:05d}.parquet")
+    shutil.move(pq_path, dest)
+    return dest, rows
+
+
+def _commit_with_backoff(fn, what: str) -> None:
+    delays = [0, 30, 120, 300, 900, 1800]
+    for attempt, delay in enumerate(delays):
+        if delay:
+            log.warning("%s backoff %ds (attempt %d/%d)…", what, delay, attempt + 1, len(delays))
+            time.sleep(delay)
+        try:
+            fn()
+            return
+        except Exception as e:
+            rate = "429" in str(e) or "Too Many Requests" in str(e)
+            log.warning("%s failed%s: %s", what, " (rate-limited)" if rate else "", e)
+            if attempt == len(delays) - 1:
+                raise
+
+
+def upload_pending(cfg, state: dict, seen: set[str]) -> int:
+    """Upload ALL locally-collected parquet shards in ONE folder commit, then the
+    resume state in a second commit. Sidesteps the per-commit rate limit entirely."""
+    from huggingface_hub import CommitOperationAdd, HfApi
+
+    pdir = pending_dir(cfg)
+    files = sorted(f for f in os.listdir(pdir) if f.endswith(".parquet"))
+    api = HfApi(token=require_token())
+
+    if files:
+        log.info("bulk-uploading %d pending shard(s) in ONE commit…", len(files))
+        _commit_with_backoff(
+            lambda: api.upload_folder(
+                folder_path=pdir, path_in_repo=HUB_SHARD_DIR, repo_type="dataset",
+                commit_message=f"bulk upload {len(files)} audio shards",
+            ),
+            "folder upload",
+        )
+        for f in files:
+            try:
+                idx = int(f[len("shard_"):-len(".parquet")])
+                upsert_shard(state, idx, rows=0, uploaded=True)
+            except ValueError:
+                pass
+            os.remove(os.path.join(pdir, f))
+
+    persist_state(cfg, state, seen)
+    ls, lf = local_paths(cfg.paths.audio_dir)
+    _commit_with_backoff(
+        lambda: api.create_commit(
+            repo_id=cfg.repos.data, repo_type="dataset",
+            operations=[CommitOperationAdd(path_in_repo=HUB_STATE, path_or_fileobj=ls),
+                        CommitOperationAdd(path_in_repo=HUB_FPS, path_or_fileobj=lf)],
+            commit_message="update resume state after bulk upload",
+        ),
+        "state commit",
+    )
+    log.info("bulk upload complete: %d shards -> %s", len(files), cfg.repos.data)
+    return len(files)
+
+
 def stage_shard(cfg, arrow_dir: str, idx: int, *, drop_local: bool) -> tuple[str, int]:
     """Convert one arrow shard to parquet on local disk (no Hub commit yet)."""
     parquet_path = os.path.join(cfg.paths.audio_dir, "parquet_tmp", f"shard_{idx:05d}.parquet")

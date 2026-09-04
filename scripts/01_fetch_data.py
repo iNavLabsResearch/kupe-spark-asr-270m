@@ -10,7 +10,7 @@ import _bootstrap  # noqa: F401
 import argparse
 
 from kupe_asr.config import load_config
-from kupe_asr.data.fetch import fetch, fetch_status
+from kupe_asr.data.fetch import fetch, fetch_status, upload_only
 from kupe_asr.hf_utils import hf_login
 
 
@@ -21,6 +21,15 @@ def main():
     ap.add_argument(
         "--hub-only", action="store_true",
         help="delete each local shard after it is uploaded (saves disk)",
+    )
+    ap.add_argument(
+        "--defer-upload", action="store_true",
+        help="fetch with ZERO Hub commits: collect parquet in pending/, upload later "
+             "with --upload-only (never rate-limited)",
+    )
+    ap.add_argument(
+        "--upload-only", action="store_true",
+        help="upload everything in pending/ to the Hub in ONE folder commit, then exit",
     )
     ap.add_argument(
         "--status", action="store_true",
@@ -39,7 +48,10 @@ def main():
     if args.status:
         fetch_status(cfg, reset=args.reset)
         return
-    fetch(cfg, hub_only=args.hub_only, reset=args.reset)
+    if args.upload_only:
+        upload_only(cfg)
+        return
+    fetch(cfg, hub_only=args.hub_only, reset=args.reset, defer_upload=args.defer_upload)
 
 
 if __name__ == "__main__":
