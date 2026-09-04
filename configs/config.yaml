@@ -49,6 +49,9 @@ mimi:
   model_id: kyutai/mimi
   num_codebooks: 1        # codebook 0 = semantic (WavLM-distilled) -> 12.5 tok/s
   batch_max_frames: 8000  # sum-of-frames VRAM budget per encode batch (raise on big GPUs)
+  files_per_chunk: 5      # audio parquet files to download+encode before each mimi upload;
+                          # smaller = less local disk held, more commits. Encoded shards +
+                          # downloaded audio are deleted after each chunk.
   push: true              # push `mimi` config after encoding
 
 model:

@@ -317,7 +317,7 @@ configs:
   - config_name: mimi
     data_files:
       - split: train
-        path: mimi/*.parquet
+        path: mimi/data/*.parquet
 ---
 
 # {project} — data
@@ -328,7 +328,7 @@ Languages: {langs}
 
 ## Configs
 - **audio** — raw speech resampled to 24 kHz mono (`audio/data/shard_*.parquet`).
-- **mimi** — Mimi codebook-0 tokens (12.5 tok/s) + transcripts (`mimi/*.parquet`). Used for training.
+- **mimi** — Mimi codebook-0 tokens (12.5 tok/s) + transcripts (`mimi/data/*.parquet`). Used for training.
 
 Shards are uploaded one-by-one as they are fetched. Resume state lives in
 `audio/fetch_state.json`.
