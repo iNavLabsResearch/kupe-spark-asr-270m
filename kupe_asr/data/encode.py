@@ -94,7 +94,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")            # stream DL to disk (low RAM)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    from transformers import AutoFeatureExtractor, MimiModel
+    from transformers import MimiModel
 
     token = require_token()
     ensure_repo(cfg.repos.data, "dataset")
@@ -114,7 +114,6 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     nd = len(devices)
     budget_total = budget * nd
 
-    fe = AutoFeatureExtractor.from_pretrained(cfg.mimi.model_id, token=hf_token())
     models = [MimiModel.from_pretrained(cfg.mimi.model_id, token=hf_token()).to(d).eval()
               for d in devices]
     api = HfApi(token=token)
@@ -196,14 +195,18 @@ def encode(cfg, *, from_hub: bool = True) -> str:
             return []
         model, dev = models[gi], devices[gi]
         try:
-            inp = fe(raw_audio=arrays, sampling_rate=MIMI_SAMPLE_RATE, return_tensors="pt", padding=True)
-            iv = inp["input_values"].to(dev)
-            pm = inp.get("padding_mask")
-            pm = pm.to(dev) if pm is not None else None
+            # Mimi wants raw waveform [B,1,T]; the Encodec-style extractor only pads,
+            # so build it directly (no AutoFeatureExtractor dependency). Clips are
+            # length-sorted, so padding is minimal; causal conv makes it safe to trim.
+            maxlen = max(a.shape[0] for a in arrays)
+            iv = torch.zeros(len(arrays), 1, maxlen, dtype=torch.float32)
+            for i, a in enumerate(arrays):
+                iv[i, 0, : a.shape[0]] = torch.from_numpy(a)
+            iv = iv.to(dev)
             ac = torch.autocast(device_type="cuda", dtype=dtype) if dev.startswith("cuda") and use_autocast \
                 else contextlib.nullcontext()
             with torch.no_grad(), ac:
-                codes = model.encode(iv, pm, num_quantizers=n_cb).audio_codes[:, 0, :].to("cpu").numpy()
+                codes = model.encode(iv, num_quantizers=n_cb).audio_codes[:, 0, :].to("cpu").numpy()
         except Exception as e:
             if dev.startswith("cuda"):
                 torch.cuda.empty_cache()
