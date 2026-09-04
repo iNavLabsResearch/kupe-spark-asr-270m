@@ -1,21 +1,22 @@
-"""Stage 2 — Hub-chunked Mimi encoding.
+"""Stage 2 — pipelined, Hub-chunked Mimi encoding.
 
-Pulls OUR uploaded `audio` parquet from the Hub a few files at a time, Mimi-encodes
-them to codebook-0 tokens, pushes the resulting `mimi` shards back to the Hub, and
-deletes local copies as it goes. Never holds the whole dataset on disk or in RAM.
+Three overlapping stages so the GPU never waits:
+  [downloader thread] prefetch N audio parquet from the Hub  (bounded by disk)
+        -> [decoder thread] soundfile-decode clips into GPU-ready batches
+              -> [GPU] Mimi-encode cb0, write mimi shards
+                    -> [uploader thread] commit shards + delete locally (background)
 
-  audio/data/*.parquet  --download chunk-->  Mimi encode  --upload-->  mimi/data/*.parquet
-                         (deleted after)                    (deleted after)
-
-Resume: `mimi/encode_state.json` records which audio files are already encoded.
+Resumable via mimi/encode_state.json (skips already-encoded audio files).
 """
 from __future__ import annotations
 
 import contextlib
 import math
 import os
+import queue
 import shutil
 import tempfile
+import threading
 
 import numpy as np
 from tqdm import tqdm
@@ -34,20 +35,16 @@ from .sources import _decode_audio
 HUB_AUDIO_PREFIX = "audio/data/"
 HUB_MIMI_DIR = "mimi/data"
 HUB_MIMI_STATE = "mimi/encode_state.json"
+_DONE = object()          # sentinel
 
 
 def _features():
     from datasets import Features, Sequence, Value
 
     return Features({
-        "id": Value("string"),
-        "language": Value("string"),
-        "source": Value("string"),
-        "text": Value("string"),
-        "duration": Value("float32"),
-        "split": Value("string"),
-        "num_frames": Value("int32"),
-        "mimi_cb0": Sequence(Value("int32")),
+        "id": Value("string"), "language": Value("string"), "source": Value("string"),
+        "text": Value("string"), "duration": Value("float32"), "split": Value("string"),
+        "num_frames": Value("int32"), "mimi_cb0": Sequence(Value("int32")),
     })
 
 
@@ -69,278 +66,255 @@ def _load_state(cfg, token: str):
 
 
 def encode_status(cfg) -> dict:
-    """Print how many audio parquet are encoded/uploaded vs left, from encode_state.json."""
     token = require_token()
     ensure_repo(cfg.repos.data, "dataset")
     audio_files = _list_audio_files(cfg.repos.data, token)
     state, _ = _load_state(cfg, token)
     done = set(state["audio_files_done"])
-    todo = [f for f in audio_files if f not in done]
-    pct = 100.0 * len(done) / max(1, len(audio_files))
-    log.info("===== encode status =====")
-    log.info("audio parquet: %d total | %d encoded+uploaded (%.1f%%) | %d LEFT",
-             len(audio_files), len(done), pct, len(todo))
-    log.info("next up: %s", [os.path.basename(f) for f in todo[:5]] or "none — all done")
-    log.info("mimi shards written so far (next index): %d", int(state["next_mimi_index"]))
-    log.info("=========================")
-    return {"total": len(audio_files), "done": len(done), "left": len(todo)}
+    left = [f for f in audio_files if f not in done]
+    log.info("encode: %d/%d parquet done (%.1f%%), %d LEFT",
+             len(done), len(audio_files), 100.0 * len(done) / max(1, len(audio_files)), len(left))
+    return {"total": len(audio_files), "done": len(done), "left": len(left)}
 
 
 def encode(cfg, *, from_hub: bool = True) -> str:
     import datasets
     import torch
+    from concurrent.futures import ThreadPoolExecutor
     from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
-    from transformers import AutoFeatureExtractor, MimiModel
 
     datasets.utils.logging.set_verbosity_error()
-    # Xet reconstruction buffers the whole file in RAM and OOMs small boxes on big
-    # shards; plain HTTP streams to disk. Opt back in by exporting HF_HUB_DISABLE_XET=0.
-    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-    # reduce CUDA fragmentation OOMs (works with the per-batch OOM auto-split below)
+    datasets.disable_progress_bars()                       # quiet "Creating parquet…" bars
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")   # quiet per-file DL bars
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")            # stream DL to disk (low RAM)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    from transformers import AutoFeatureExtractor, MimiModel
 
     token = require_token()
     ensure_repo(cfg.repos.data, "dataset")
-    # works on any backend: multi-CUDA (2x T4 / 4090 / H100 / ...), Apple MPS, or CPU
     if torch.cuda.is_available():
         devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
     elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         devices = ["mps"]
     else:
         devices = ["cpu"]
-    use_autocast = devices[0].startswith("cuda")         # fp16 autocast only on CUDA
-    autocast_dtype = torch.float16 if use_autocast else torch.float32
+    use_autocast = devices[0].startswith("cuda")
+    dtype = torch.float16 if use_autocast else torch.float32
     n_cb = int(cfg.mimi.num_codebooks)
     budget = int(cfg.mimi.batch_max_frames)
     shard_size = int(cfg.data.shard_size)
     files_per_chunk = int(getattr(cfg.mimi, "files_per_chunk", 5))
+    prefetch = int(getattr(cfg.mimi, "prefetch", 4))
+    nd = len(devices)
+    budget_total = budget * nd
 
     fe = AutoFeatureExtractor.from_pretrained(cfg.mimi.model_id, token=hf_token())
     models = [MimiModel.from_pretrained(cfg.mimi.model_id, token=hf_token()).to(d).eval()
               for d in devices]
-    log.info("Mimi on %s (%d GPU(s), codebooks=%d, budget=%d frames/GPU, %d files/chunk)",
-             devices, len(devices), n_cb, budget, files_per_chunk)
-    if devices[0] == "cpu":
-        log.warning("running encode on CPU — slow; run stage 2 on the GPU box.")
+    api = HfApi(token=token)
 
     audio_files = _list_audio_files(cfg.repos.data, token)
     state, local_state = _load_state(cfg, token)
     done = set(state["audio_files_done"])
     todo = [f for f in audio_files if f not in done]
-    pct = 100.0 * len(done) / max(1, len(audio_files))
-    log.info("=== encode progress: %d/%d audio parquet done (%.1f%%), %d LEFT ===",
-             len(done), len(audio_files), pct, len(todo))
+    total, base = len(audio_files), len(done)
+    log.info("Mimi on %s | %d/%d parquet done, %d LEFT | batch=%d/GPU, prefetch=%d",
+             devices, base, total, len(todo), budget, prefetch)
     if not todo:
-        log.info("nothing to encode — mimi is up to date")
         return cfg.repos.data
 
     dl_root = os.path.join(cfg.paths.mimi_dir, "dl")
     pending = os.path.join(cfg.paths.mimi_dir, "pending")
     os.makedirs(dl_root, exist_ok=True)
     os.makedirs(pending, exist_ok=True)
-    api = HfApi(token=token)
 
-    def frames_of(dur: float) -> int:
+    decode_pool = ThreadPoolExecutor(max_workers=8)
+    gpu_pool = ThreadPoolExecutor(max_workers=nd)
+    up_pool = ThreadPoolExecutor(max_workers=1)
+    inflight: list = []
+
+    def frames_of(dur):
         return max(1, int(math.ceil(dur * MIMI_FRAME_RATE)))
 
-    buf: list[dict] = []
+    # ---- shard writing + background upload -------------------------------
+    buf: list = []
     mimi_idx = int(state["next_mimi_index"])
-    chunk_files: list[str] = []          # mimi shard filenames written since last upload
+    chunk_files: list[str] = []
 
     def flush_shard():
         nonlocal buf, mimi_idx
         if not buf:
             return
         from datasets import Dataset
-
-        path = os.path.join(pending, f"shard_{mimi_idx:05d}.parquet")
-        Dataset.from_list(buf, features=_features()).to_parquet(path)
-        chunk_files.append(os.path.basename(path))
-        log.info("wrote %s (%d rows)", os.path.basename(path), len(buf))
+        name = f"shard_{mimi_idx:05d}.parquet"
+        Dataset.from_list(buf, features=_features()).to_parquet(os.path.join(pending, name))
+        chunk_files.append(name)
         mimi_idx += 1
         buf = []
 
-    from concurrent.futures import ThreadPoolExecutor
-
-    pool = ThreadPoolExecutor(max_workers=max(len(devices), 4))
-    nd = len(devices)
-    budget_total = budget * nd            # each GPU gets ~budget frames
-    clips_done = 0
-
-    def _is_oom(e: Exception) -> bool:
-        return isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
-
-    def _encode_part(gi, arrays, metas):
-        """Encode a sub-batch on GPU `gi`; recursively split on OOM. Returns row dicts."""
-        if not arrays:
-            return []
-        model, device = models[gi], devices[gi]
-        try:
-            inputs = fe(raw_audio=arrays, sampling_rate=MIMI_SAMPLE_RATE,
-                        return_tensors="pt", padding=True)
-            iv = inputs["input_values"].to(device)
-            pm = inputs.get("padding_mask")
-            pm = pm.to(device) if pm is not None else None
-            ac = torch.autocast(device_type="cuda", dtype=autocast_dtype) \
-                if device.startswith("cuda") and use_autocast else contextlib.nullcontext()
-            with torch.no_grad(), ac:
-                out = model.encode(iv, pm, num_quantizers=n_cb)
-            codes = out.audio_codes[:, 0, :].to("cpu").numpy()
-        except Exception as e:
-            if device.startswith("cuda"):
-                torch.cuda.empty_cache()
-            if _is_oom(e) and len(arrays) > 1:
-                mid = len(arrays) // 2
-                return (_encode_part(gi, arrays[:mid], metas[:mid])
-                        + _encode_part(gi, arrays[mid:], metas[mid:]))
-            if _is_oom(e) and len(arrays) == 1:
-                log.warning("skip 1 clip that OOMs alone (%.1fs)", float(metas[0].get("duration", 0)))
-                return []
-            raise
-        rows = []
-        for j, r in enumerate(metas):
-            nf = min(codes.shape[1], frames_of(r["duration"]))
-            rows.append({
-                "id": r.get("id") or "", "language": r.get("language") or "",
-                "source": r.get("source") or "", "text": r.get("text") or "",
-                "duration": float(r["duration"]), "split": r.get("split") or "train",
-                "num_frames": int(nf), "mimi_cb0": codes[j, :nf].astype(np.int32).tolist(),
-            })
-        return rows
-
-    def encode_batch(arrays, metas):
-        # split the batch across all GPUs and run them concurrently (threads)
-        nonlocal clips_done
-        if not arrays:
-            return
-        step = math.ceil(len(arrays) / nd)
-        chunks = [(arrays[i:i + step], metas[i:i + step]) for i in range(0, len(arrays), step)]
-        futs = [pool.submit(_encode_part, min(k, nd - 1), a, m) for k, (a, m) in enumerate(chunks)]
-        for f in futs:
-            for row in f.result():
-                buf.append(row)
-                clips_done += 1
-                if len(buf) >= shard_size:
-                    flush_shard()
-
-    # --- background uploader: encoding never blocks on Hub commits ---
-    up_pool = ThreadPoolExecutor(max_workers=1)   # serialize commits
-    inflight: list = []
-    max_inflight = 2                              # bound disk to ~2 chunks
-
     def _do_upload(files, snap):
-        if not files:
+        if not files or not cfg.mimi.push:
             return
-        if not cfg.mimi.push:
-            log.info("[bg] mimi shards kept local (--no-push)")
-            return
-        tmp_state = os.path.join(cfg.paths.mimi_dir, f".state_{files[0]}.json")
-        save_json(tmp_state, snap)
+        tmp = os.path.join(cfg.paths.mimi_dir, f".st_{files[0]}.json")
+        save_json(tmp, snap)
         ops = [CommitOperationAdd(f"{HUB_MIMI_DIR}/{f}", os.path.join(pending, f)) for f in files]
-        ops.append(CommitOperationAdd(HUB_MIMI_STATE, tmp_state))
-        _commit_with_backoff(
-            lambda: api.create_commit(repo_id=cfg.repos.data, repo_type="dataset",
-                                      operations=ops, commit_message=f"mimi: +{len(files)} shards"),
-            "mimi commit",
-        )
-        for f in files:                          # delete only THIS chunk's files
-            try:
-                os.remove(os.path.join(pending, f))
-            except OSError:
-                pass
-        try:
-            os.remove(tmp_state)
-        except OSError:
-            pass
+        ops.append(CommitOperationAdd(HUB_MIMI_STATE, tmp))
+        _commit_with_backoff(lambda: api.create_commit(
+            repo_id=cfg.repos.data, repo_type="dataset", operations=ops,
+            commit_message=f"mimi: +{len(files)} shards"), "mimi commit")
+        for f in files:
+            try: os.remove(os.path.join(pending, f))
+            except OSError: pass
+        try: os.remove(tmp)
+        except OSError: pass
         ensure_data_card(cfg)
-        log.info("[bg] uploaded %d mimi shard(s); local cleared", len(files))
+        log.info("[bg] uploaded %d mimi shards, local cleared", len(files))
 
     def submit_upload():
         nonlocal chunk_files
         if not chunk_files:
             return
         files, chunk_files = chunk_files, []
-        snap = {"audio_files_done": list(state["audio_files_done"]),
-                "next_mimi_index": int(mimi_idx)}
+        snap = {"audio_files_done": list(state["audio_files_done"]), "next_mimi_index": int(mimi_idx)}
         inflight.append(up_pool.submit(_do_upload, files, snap))
         inflight[:] = [f for f in inflight if not f.done()]
-        while len(inflight) > max_inflight:      # backpressure: keep disk bounded
+        while len(inflight) > 2:
             inflight.pop(0).result()
 
-    processed = 0
-    total = len(audio_files)
-    base_done = len(done)
-    audio_cols = ["id", "language", "source", "text", "duration", "split", "audio"]
-    import pyarrow.parquet as pq
+    # ---- GPU encode (multi-GPU, OOM auto-split) --------------------------
+    def _oom(e):
+        return isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
 
+    def _part(gi, arrays, metas):
+        if not arrays:
+            return []
+        model, dev = models[gi], devices[gi]
+        try:
+            inp = fe(raw_audio=arrays, sampling_rate=MIMI_SAMPLE_RATE, return_tensors="pt", padding=True)
+            iv = inp["input_values"].to(dev)
+            pm = inp.get("padding_mask")
+            pm = pm.to(dev) if pm is not None else None
+            ac = torch.autocast(device_type="cuda", dtype=dtype) if dev.startswith("cuda") and use_autocast \
+                else contextlib.nullcontext()
+            with torch.no_grad(), ac:
+                codes = model.encode(iv, pm, num_quantizers=n_cb).audio_codes[:, 0, :].to("cpu").numpy()
+        except Exception as e:
+            if dev.startswith("cuda"):
+                torch.cuda.empty_cache()
+            if _oom(e) and len(arrays) > 1:
+                m = len(arrays) // 2
+                return _part(gi, arrays[:m], metas[:m]) + _part(gi, arrays[m:], metas[m:])
+            if _oom(e):
+                return []
+            raise
+        rows = []
+        for j, r in enumerate(metas):
+            nf = min(codes.shape[1], frames_of(r["duration"]))
+            rows.append({"id": r.get("id") or "", "language": r.get("language") or "",
+                         "source": r.get("source") or "", "text": r.get("text") or "",
+                         "duration": float(r["duration"]), "split": r.get("split") or "train",
+                         "num_frames": int(nf), "mimi_cb0": codes[j, :nf].astype(np.int32).tolist()})
+        return rows
 
-    processed = 0
-    total = len(audio_files)
-    base_done = len(done)
-    audio_cols = ["id", "language", "source", "text", "duration", "split", "audio"]
-    import pyarrow.parquet as pq
+    def gpu_encode(arrays, metas):
+        step = math.ceil(len(arrays) / nd)
+        futs = [gpu_pool.submit(_part, min(k, nd - 1), arrays[i:i + step], metas[i:i + step])
+                for k, i in enumerate(range(0, len(arrays), step))]
+        for f in futs:
+            for row in f.result():
+                buf.append(row)
+                if len(buf) >= shard_size:
+                    flush_shard()
+
+    # ---- downloader thread (prefetch, disk-bounded) ----------------------
+    dlq: queue.Queue = queue.Queue(maxsize=prefetch)
+
+    def downloader():
+        for af in todo:
+            d = tempfile.mkdtemp(dir=dl_root)
+            try:
+                p = hf_hub_download(cfg.repos.data, af, repo_type="dataset", token=token, local_dir=d)
+                dlq.put((af, d, p))          # blocks when `prefetch` files are on disk
+            except Exception as e:
+                shutil.rmtree(d, ignore_errors=True)
+                log.warning("download %s failed: %s", af, e)
+        dlq.put(_DONE)
+
+    # ---- decoder thread (produces GPU-ready batches) ---------------------
+    batchq: queue.Queue = queue.Queue(maxsize=max(2, 2 * nd))
+
+    def decoder():
+        import pyarrow.parquet as pq
+        cols = ["id", "language", "source", "text", "duration", "split", "audio"]
+        while True:
+            item = dlq.get()
+            if item is _DONE:
+                break
+            af, d, p = item
+            arrays, metas, frames = [], [], 0
+            try:
+                pf = pq.ParquetFile(p)
+                for b in pf.iter_batches(batch_size=64, columns=cols):
+                    for arr, rec in decode_pool.map(_decode_rec, b.to_pylist()):
+                        if arr is None or not rec.get("duration"):
+                            continue
+                        nf = frames_of(rec["duration"])
+                        if arrays and frames + nf > budget_total:
+                            batchq.put(("batch", arrays, metas))
+                            arrays, metas, frames = [], [], 0
+                        arrays.append(arr); metas.append(rec); frames += nf
+                if arrays:
+                    batchq.put(("batch", arrays, metas))
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+            batchq.put(("file", af))
+        batchq.put(_DONE)
 
     def _decode_rec(rec):
         try:
-            arr, _ = _decode_audio(rec.get("audio"))
-            return (np.asarray(arr, dtype=np.float32) if arr is not None else None), rec
+            a, _ = _decode_audio(rec.get("audio"))
+            return (np.asarray(a, dtype=np.float32) if a is not None else None), rec
         except Exception:
             return None, rec
 
-    pbar = tqdm(todo, desc="encode files", unit="file")   # tqdm shows the ETA
-    for af in pbar:
-        cur = base_done + processed + 1
-        pbar.set_postfix_str(f"{clips_done} clips | {nd}xGPU | {total - cur + 1} left")
-        log.info("encoding %d/%d (%d left): %s", cur, total, total - cur, af)
-        tmp = tempfile.mkdtemp(dir=dl_root)
-        try:
-            local = hf_hub_download(cfg.repos.data, af, repo_type="dataset",
-                                    token=token, local_dir=tmp)
-            pf = pq.ParquetFile(local)
-            arrays: list = []
-            metas: list = []
-            frames = 0
-            for b in pf.iter_batches(batch_size=64, columns=audio_cols):
-                for arr, rec in pool.map(_decode_rec, b.to_pylist()):   # threaded decode
-                    if arr is None or not rec.get("duration"):
-                        continue
-                    nf = frames_of(rec["duration"])
-                    if arrays and frames + nf > budget_total:
-                        encode_batch(arrays, metas)
-                        arrays, metas, frames = [], [], 0
-                    arrays.append(arr)
-                    metas.append(rec)
-                    frames += nf
-            encode_batch(arrays, metas)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)   # delete downloaded audio
+    threading.Thread(target=downloader, daemon=True).start()
+    threading.Thread(target=decoder, daemon=True).start()
 
-        state["audio_files_done"] = sorted(set(state["audio_files_done"]) | {af})
-        state["next_mimi_index"] = mimi_idx
-        save_json(local_state, state)
-        processed += 1
+    # ---- GPU consumer (main) --------------------------------------------
+    processed = 0
+    hours_done = 0.0
+    pbar = tqdm(total=len(todo), unit="file", desc="encode",
+                bar_format="{l_bar}{bar}| {n}/{total} files [{elapsed}<{remaining}] {postfix}")
+    while True:
+        item = batchq.get()
+        if item is _DONE:
+            break
+        if item[0] == "batch":
+            _, arrays, metas = item
+            gpu_encode(arrays, metas)
+            hours_done += sum(m["duration"] for m in metas) / 3600.0
+        else:  # file finished
+            state["audio_files_done"] = sorted(set(state["audio_files_done"]) | {item[1]})
+            state["next_mimi_index"] = mimi_idx
+            save_json(local_state, state)
+            processed += 1
+            if devices[0].startswith("cuda"):
+                torch.cuda.empty_cache()
+            if processed % files_per_chunk == 0:
+                flush_shard()
+                submit_upload()
+            eta_h = (hours_done / processed) * (len(todo) - processed) if processed else 0.0
+            pbar.update(1)
+            pbar.set_postfix_str(f"{hours_done:.1f}h enc · ~{eta_h:.0f}h left · {len(todo)-processed} files")
 
-        if devices[0].startswith("cuda"):
-            torch.cuda.empty_cache()       # keep VRAM defragmented between files
-        try:                               # return freed heap to the OS
-            import ctypes
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
-        if processed % files_per_chunk == 0:
-            flush_shard()
-            submit_upload()                # upload + delete in the BACKGROUND; encoding continues
-            log.info("=== encode progress: %d/%d done (%.1f%%), %d LEFT (upload in bg) ===",
-                     base_done + processed, total,
-                     100.0 * (base_done + processed) / max(1, total), total - base_done - processed)
-
+    pbar.close()
     flush_shard()
     submit_upload()
-    log.info("waiting for background uploads to finish…")
-    for f in inflight:                     # drain remaining bg uploads
+    for f in inflight:
         f.result()
-    up_pool.shutdown(wait=True)
-    pool.shutdown(wait=True)
-    log.info("encode DONE: %d/%d audio parquet encoded -> mimi on %s",
-             base_done + processed, total, cfg.repos.data)
+    for pl in (gpu_pool, decode_pool, up_pool):
+        pl.shutdown(wait=True)
+    log.info("encode DONE: %d/%d parquet, %.1f h encoded -> %s", base + processed, total,
+             hours_done, cfg.repos.data)
     return cfg.repos.data
