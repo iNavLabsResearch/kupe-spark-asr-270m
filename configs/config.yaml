@@ -33,7 +33,9 @@ data:
   min_dur: 1.0            # drop clips shorter than this (seconds)
   max_dur: 20.0           # drop clips longer than this (seconds)
   val_minutes_per_lang: 20
-  shard_size: 300         # examples buffered in RAM per shard (lower = less memory)
+  shard_size: 1000        # rows per parquet file (~300-350MB). Higher = fewer/bigger
+                          # files but more RAM at flush; 1000 is safe now that the
+                          # source reads one file at a time. Use 2000 if RAM >= 8GB.
   streaming: true
   num_proc: 8
   push: true              # 01 uploads each shard to Hub as it is written; resume via fetch_state.json
