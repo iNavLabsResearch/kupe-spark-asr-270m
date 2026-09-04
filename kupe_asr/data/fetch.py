@@ -10,11 +10,23 @@ On restart:
 """
 from __future__ import annotations
 
+import gc
 import os
 import shutil
 
 import numpy as np
 from tqdm import tqdm
+
+
+def _free_memory() -> None:
+    """Return freed heap to the OS. Audio+Arrow loops fragment glibc's allocator,
+    so RSS creeps up and OOM-kills on small boxes without this."""
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 from ..constants import LANGUAGES, MIMI_SAMPLE_RATE
 from ..hf_utils import ensure_repo, log, require_token
@@ -163,6 +175,7 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
             return
         upload_arrow_shard(cfg, state, seen, idx, arrow_dir, drop_local=hub_only)
         hub_indices.add(idx)
+        _free_memory()          # keep RSS flat across many shards
 
     writer = ShardWriter(
         shards_dir, _features(target_sr), int(cfg.data.shard_size),
