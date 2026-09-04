@@ -99,14 +99,14 @@ def encode(cfg, *, from_hub: bool = True) -> str:
 
     token = require_token()
     ensure_repo(cfg.repos.data, "dataset")
-    # works on any backend: CUDA (4090/L4/H100/RTX PRO 6000/...), Apple MPS, or CPU
+    # works on any backend: multi-CUDA (2x T4 / 4090 / H100 / ...), Apple MPS, or CPU
     if torch.cuda.is_available():
-        device = "cuda"
+        devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
     elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        device = "mps"
+        devices = ["mps"]
     else:
-        device = "cpu"
-    use_autocast = device == "cuda"                       # fp16 autocast only on CUDA
+        devices = ["cpu"]
+    use_autocast = devices[0].startswith("cuda")         # fp16 autocast only on CUDA
     autocast_dtype = torch.float16 if use_autocast else torch.float32
     n_cb = int(cfg.mimi.num_codebooks)
     budget = int(cfg.mimi.batch_max_frames)
@@ -114,12 +114,12 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     files_per_chunk = int(getattr(cfg.mimi, "files_per_chunk", 5))
 
     fe = AutoFeatureExtractor.from_pretrained(cfg.mimi.model_id, token=hf_token())
-    mimi = MimiModel.from_pretrained(cfg.mimi.model_id, token=hf_token()).to(device).eval()
-    log.info("Mimi on %s (codebooks=%d, budget=%d frames, %d files/chunk)",
-             device, n_cb, budget, files_per_chunk)
-    if device == "cpu":
-        log.warning("running encode on CPU — this is slow and RAM-heavy; run stage 2 on "
-                    "the GPU box (CUDA + more RAM). Big early audio shards can OOM here.")
+    models = [MimiModel.from_pretrained(cfg.mimi.model_id, token=hf_token()).to(d).eval()
+              for d in devices]
+    log.info("Mimi on %s (%d GPU(s), codebooks=%d, budget=%d frames/GPU, %d files/chunk)",
+             devices, len(devices), n_cb, budget, files_per_chunk)
+    if devices[0] == "cpu":
+        log.warning("running encode on CPU — slow; run stage 2 on the GPU box.")
 
     audio_files = _list_audio_files(cfg.repos.data, token)
     state, local_state = _load_state(cfg, token)
@@ -156,50 +156,68 @@ def encode(cfg, *, from_hub: bool = True) -> str:
         mimi_idx += 1
         buf = []
 
-    def _forward(arrays):
-        inputs = fe(raw_audio=arrays, sampling_rate=MIMI_SAMPLE_RATE,
-                    return_tensors="pt", padding=True)
-        iv = inputs["input_values"].to(device)
-        pm = inputs.get("padding_mask")
-        pm = pm.to(device) if pm is not None else None
-        ac = torch.autocast(device_type="cuda", dtype=autocast_dtype) if use_autocast \
-            else contextlib.nullcontext()
-        with torch.no_grad(), ac:
-            out = mimi.encode(iv, pm, num_quantizers=n_cb)
-        return out.audio_codes[:, 0, :].to("cpu").numpy()
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=max(len(devices), 4))
+    nd = len(devices)
+    budget_total = budget * nd            # each GPU gets ~budget frames
+    clips_done = 0
 
     def _is_oom(e: Exception) -> bool:
         return isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
 
-    def encode_batch(arrays, metas):
-        # VRAM-adaptive: on OOM, split the batch and retry so it fits any GPU size.
+    def _encode_part(gi, arrays, metas):
+        """Encode a sub-batch on GPU `gi`; recursively split on OOM. Returns row dicts."""
         if not arrays:
-            return
+            return []
+        model, device = models[gi], devices[gi]
         try:
-            codes = _forward(arrays)
+            inputs = fe(raw_audio=arrays, sampling_rate=MIMI_SAMPLE_RATE,
+                        return_tensors="pt", padding=True)
+            iv = inputs["input_values"].to(device)
+            pm = inputs.get("padding_mask")
+            pm = pm.to(device) if pm is not None else None
+            ac = torch.autocast(device_type="cuda", dtype=autocast_dtype) \
+                if device.startswith("cuda") and use_autocast else contextlib.nullcontext()
+            with torch.no_grad(), ac:
+                out = model.encode(iv, pm, num_quantizers=n_cb)
+            codes = out.audio_codes[:, 0, :].to("cpu").numpy()
         except Exception as e:
-            if device == "cuda":
+            if device.startswith("cuda"):
                 torch.cuda.empty_cache()
             if _is_oom(e) and len(arrays) > 1:
                 mid = len(arrays) // 2
-                encode_batch(arrays[:mid], metas[:mid])
-                encode_batch(arrays[mid:], metas[mid:])
-                return
+                return (_encode_part(gi, arrays[:mid], metas[:mid])
+                        + _encode_part(gi, arrays[mid:], metas[mid:]))
             if _is_oom(e) and len(arrays) == 1:
-                log.warning("skipping 1 clip that OOMs alone (%.1fs) — raise a bigger GPU",
-                            float(metas[0].get("duration", 0)))
-                return
+                log.warning("skip 1 clip that OOMs alone (%.1fs)", float(metas[0].get("duration", 0)))
+                return []
             raise
+        rows = []
         for j, r in enumerate(metas):
             nf = min(codes.shape[1], frames_of(r["duration"]))
-            buf.append({
+            rows.append({
                 "id": r.get("id") or "", "language": r.get("language") or "",
                 "source": r.get("source") or "", "text": r.get("text") or "",
                 "duration": float(r["duration"]), "split": r.get("split") or "train",
                 "num_frames": int(nf), "mimi_cb0": codes[j, :nf].astype(np.int32).tolist(),
             })
-            if len(buf) >= shard_size:
-                flush_shard()
+        return rows
+
+    def encode_batch(arrays, metas):
+        # split the batch across all GPUs and run them concurrently (threads)
+        nonlocal clips_done
+        if not arrays:
+            return
+        step = math.ceil(len(arrays) / nd)
+        chunks = [(arrays[i:i + step], metas[i:i + step]) for i in range(0, len(arrays), step)]
+        futs = [pool.submit(_encode_part, min(k, nd - 1), a, m) for k, (a, m) in enumerate(chunks)]
+        for f in futs:
+            for row in f.result():
+                buf.append(row)
+                clips_done += 1
+                if len(buf) >= shard_size:
+                    flush_shard()
 
     def upload_chunk():
         """Commit all pending mimi shards + resume state in ONE commit, then clear disk."""
@@ -230,8 +248,17 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     audio_cols = ["id", "language", "source", "text", "duration", "split", "audio"]
     import pyarrow.parquet as pq
 
-    for af in tqdm(todo, desc="encode files", unit="file"):
+    def _decode_rec(rec):
+        try:
+            arr, _ = _decode_audio(rec.get("audio"))
+            return (np.asarray(arr, dtype=np.float32) if arr is not None else None), rec
+        except Exception:
+            return None, rec
+
+    pbar = tqdm(todo, desc="encode files", unit="file")   # tqdm shows the ETA
+    for af in pbar:
         cur = base_done + processed + 1
+        pbar.set_postfix_str(f"{clips_done} clips | {nd}xGPU | {total - cur + 1} left")
         log.info("encoding %d/%d (%d left): %s", cur, total, total - cur, af)
         tmp = tempfile.mkdtemp(dir=dl_root)
         try:
@@ -241,20 +268,15 @@ def encode(cfg, *, from_hub: bool = True) -> str:
             arrays: list = []
             metas: list = []
             frames = 0
-            # small batch + column filter -> low peak RAM even on big early shards
-            for b in pf.iter_batches(batch_size=8, columns=audio_cols):
-                for rec in b.to_pylist():
-                    try:
-                        arr, sr = _decode_audio(rec.get("audio"))
-                    except Exception:
-                        arr = None
+            for b in pf.iter_batches(batch_size=64, columns=audio_cols):
+                for arr, rec in pool.map(_decode_rec, b.to_pylist()):   # threaded decode
                     if arr is None or not rec.get("duration"):
                         continue
                     nf = frames_of(rec["duration"])
-                    if arrays and frames + nf > budget:
+                    if arrays and frames + nf > budget_total:
                         encode_batch(arrays, metas)
                         arrays, metas, frames = [], [], 0
-                    arrays.append(np.asarray(arr, dtype=np.float32))
+                    arrays.append(arr)
                     metas.append(rec)
                     frames += nf
             encode_batch(arrays, metas)
@@ -280,6 +302,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
 
     flush_shard()
     upload_chunk()
+    pool.shutdown(wait=True)
     log.info("encode DONE: %d/%d audio parquet encoded -> mimi on %s",
              base_done + processed, total, cfg.repos.data)
     return cfg.repos.data
