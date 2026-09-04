@@ -148,7 +148,9 @@ def main() -> int:
             check("local rows == compact parquet rows", stats["n"] == pq_rows,
                   f"local={stats['n']} parquet={pq_rows}")
         check("no duplicate ids", not stats["dup_ids"],
-              f"{len(stats['dup_ids'])} ids repeated" if stats["dup_ids"] else "ids unique")
+              (f"{len(stats['dup_ids'])} ids repeated: "
+               + ", ".join(repr(k) for k in list(stats["dup_ids"])[:9]))
+              if stats["dup_ids"] else "ids unique")
         check("no empty ids", stats["empty_ids"] == 0, f"{stats['empty_ids']} empty")
         n_train = int(stats["splits"].get("train") or 0)
         n_val = int(stats["splits"].get("val") or 0)
