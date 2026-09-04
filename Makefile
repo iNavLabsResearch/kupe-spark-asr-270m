@@ -1,4 +1,4 @@
-.PHONY: setup repos fetch fetch-status fetch-hub encode encode-hub train train-hub train-multi eval stream all
+.PHONY: setup repos fetch fetch-status fetch-hub encode encode-hub compact train train-hub train-multi eval stream all
 
 setup:
 	pip install -r requirements.txt
@@ -20,7 +20,7 @@ fetch-hub:
 fetch-defer:
 	python scripts/01_fetch_data.py --defer-upload
 
-# send everything in pending/ to the Hub in ONE folder commit
+# pack pending/ into bunches and upload
 upload:
 	python scripts/01_fetch_data.py --upload-only
 
@@ -30,6 +30,10 @@ encode:
 # GPU VM: pull `audio` from Hub if local is missing (or pass --from-hub)
 encode-hub:
 	python scripts/02_encode_data.py --from-hub
+
+# pack 200 tiny Hub parquet files into 1 bunch (fixes 429 Too Many Requests)
+compact:
+	python scripts/06_compact_hub.py
 
 train:
 	python scripts/03_train.py

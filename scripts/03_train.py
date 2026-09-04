@@ -2,7 +2,8 @@
 """Stage 3: train. Single GPU or, via `accelerate launch`, multi-GPU DDP.
 
     python scripts/03_train.py
-    python scripts/03_train.py --from-hub           # pull `mimi` from Hub
+    python scripts/03_train.py --from-hub           # pull bunched `mimi` from Hub
+    # If Hub 429s on thousands of tiny files:  python scripts/06_compact_hub.py
     accelerate launch scripts/03_train.py           # multi-GPU
     python scripts/03_train.py --epochs 5 --bs 32
 """

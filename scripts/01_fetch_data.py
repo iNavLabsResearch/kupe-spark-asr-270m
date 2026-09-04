@@ -1,10 +1,11 @@
 #!/usr/bin/env python
-"""Stage 1: stream + resample + shard, upload each shard to Hub, resume later.
+"""Stage 1: stream + resample + shard, pack into bunches, upload, resume later.
 
-    python scripts/01_fetch_data.py                 # fetch, upload every shard, keep local
+    python scripts/01_fetch_data.py                 # fetch, pack bunches, keep local
     python scripts/01_fetch_data.py --hub-only      # same, delete local shard after upload
     python scripts/01_fetch_data.py --status        # print resume JSON / Hub progress
     python scripts/01_fetch_data.py --no-push       # local shards only
+    python scripts/01_fetch_data.py --upload-only   # pack pending/ into bunches, upload
 """
 import _bootstrap  # noqa: F401
 import argparse
@@ -29,7 +30,7 @@ def main():
     )
     ap.add_argument(
         "--upload-only", action="store_true",
-        help="upload everything in pending/ to the Hub in ONE folder commit, then exit",
+        help="pack pending/ shards into bunch_*.parquet (200 per file, size-capped) and upload, then exit",
     )
     ap.add_argument(
         "--status", action="store_true",

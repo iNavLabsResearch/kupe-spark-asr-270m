@@ -1,12 +1,8 @@
-"""Stage 1 — stream sources, shard, upload each shard to Hub, resume later.
+"""Stage 1 — stream sources, shard, pack into bunches, upload, resume later.
 
-Each flushed shard is converted to parquet and committed immediately with
-`audio/fetch_state.json` so a crash does not lose Hub progress.
-
-On restart:
-  1. index leftover local shards
-  2. upload any shard not yet on Hub
-  3. continue fetching from the hour caps in fetch_state.json
+Local flush is still tiny `shard_*.parquet` (RAM-safe). Hub only ever sees
+`bunch_*.parquet` (200 shards packed, audio also capped at ~1.5 GB) so
+encode/train never 429 the free-tier 1000-request / 5-minute cap.
 """
 from __future__ import annotations
 
@@ -192,13 +188,13 @@ def fetch_status(cfg, *, reset: bool = False) -> dict:
 
 
 def upload_only(cfg) -> int:
-    """Bulk-upload everything collected locally under pending/ in ONE folder commit."""
+    """Pack pending/ shards into bunches and upload them to Hub."""
     require_token()
     ensure_repo(cfg.repos.data, "dataset")
     ensure_data_card(cfg)
     state, seen, _ = load_merged_state(cfg)
     n = upload_pending(cfg, state, seen)
-    log.info("upload-only done: %d shard(s) sent", n)
+    log.info("upload-only done: %d bunch(es) sent", n)
     return n
 
 
@@ -240,8 +236,8 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False, defer_upload: boo
         start_index = max(start_index, max(hub_indices) + 1)
 
     # Per-language upload: shards collect in pending/ during a language, then get
-    # pushed as ONE folder commit when that language finishes (and pending is cleared).
-    # A pending_max safety valve does an interim commit so disk can't blow up mid-language.
+    # packed into bunch_*.parquet and pushed when that language finishes.
+    # A pending_max safety valve does an interim bunch-commit so disk can't blow up.
     pending_max = int(getattr(cfg.data, "pending_max", 60))
 
     def on_flush(arrow_dir: str, idx: int, nrows: int) -> None:
@@ -257,7 +253,7 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False, defer_upload: boo
         if not defer_upload and pending_max > 0:
             n_pend = len([f for f in os.listdir(pending_dir(cfg)) if f.endswith(".parquet")])
             if n_pend >= pending_max:
-                log.info("pending/ hit %d shards -> interim folder commit (frees disk)", n_pend)
+                log.info("pending/ hit %d shards -> interim bunch commit (frees disk)", n_pend)
                 upload_pending(cfg, state, seen)
 
     writer = ShardWriter(
@@ -387,7 +383,7 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False, defer_upload: boo
         if cfg.data.push and not defer_upload:
             n_pend = len([f for f in os.listdir(pending_dir(cfg)) if f.endswith(".parquet")])
             if n_pend:
-                log.info("=== uploading %s: %d shard(s) in ONE folder commit ===", lang, n_pend)
+                log.info("=== uploading %s: packing %d shard(s) into bunches ===", lang, n_pend)
                 upload_pending(cfg, state, seen)   # uploads + deletes local pending
                 log.info("=== %s uploaded and cleared from local disk ===", lang)
 

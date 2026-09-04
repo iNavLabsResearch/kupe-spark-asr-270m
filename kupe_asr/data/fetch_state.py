@@ -49,7 +49,10 @@ def empty_state(repo_id: str, languages: list[str]) -> dict:
         "config": "audio",
         "updated_at": None,
         "next_shard_index": 0,
-        "shards": [],                 # [{index, rows, uploaded, hub_path}]
+        "next_bunch_index": 0,
+        "bunched": False,
+        "bunches": [],            # [{index, rows, uploaded, hub_path}]
+        "shards": [],             # [{index, rows, uploaded, hub_path}]
         "languages": {lang: empty_lang() for lang in languages},
     }
 
@@ -226,6 +229,16 @@ def merge_states(a: dict, b: dict, languages: list[str]) -> dict:
         int(b.get("next_shard_index") or 0),
         (max(by_idx) + 1) if by_idx else 0,
     )
+    out["next_bunch_index"] = max(
+        int(a.get("next_bunch_index") or 0),
+        int(b.get("next_bunch_index") or 0),
+    )
+    out["bunched"] = bool(a.get("bunched") or b.get("bunched"))
+    by_bunch: dict[int, dict] = {}
+    for src in (a, b):
+        for bun in src.get("bunches") or []:
+            by_bunch[int(bun["index"])] = dict(bun)
+    out["bunches"] = [by_bunch[i] for i in sorted(by_bunch)]
     out["repo"] = a.get("repo") or b.get("repo")
     return out
 
@@ -296,7 +309,10 @@ def print_status(state: dict, caps, hub_indices: set[int]) -> None:
         if not s.get("uploaded") and int(s["index"]) not in hub_indices
     ]
     on_hub = sorted(hub_indices)
+    n_bunch = len(state.get("bunches") or [])
     log.info("  Hub parquet shards: %s", on_hub[:8] + (["…", on_hub[-1]] if len(on_hub) > 8 else on_hub[8:]))
+    if n_bunch or state.get("bunched"):
+        log.info("  Hub bunches: %d (tiny shards packed 200-to-1)", n_bunch)
     log.info("  local shards still to upload: %s", [int(s["index"]) for s in local_pending] or "none")
     log.info("================================")
 
@@ -327,11 +343,12 @@ Multilingual ASR corpus for **{project}** (Gemma-3-270m + Mimi codec).
 Languages: {langs}
 
 ## Configs
-- **audio** — raw speech resampled to 24 kHz mono (`audio/data/shard_*.parquet`).
-- **mimi** — Mimi codebook-0 tokens (12.5 tok/s) + transcripts (`mimi/data/*.parquet`). Used for training.
+- **audio** — raw speech resampled to 24 kHz mono (`audio/data/bunch_*.parquet`).
+- **mimi** — Mimi codebook-0 tokens (12.5 tok/s) + transcripts (`mimi/data/bunch_*.parquet`). Used for training.
 
-Shards are uploaded one-by-one as they are fetched. Resume state lives in
-`audio/fetch_state.json`.
+Tiny `shard_*.parquet` files are packed 200-to-1 into `bunch_*.parquet` so Hub
+downloads stay under the free-tier 1000-request / 5-minute cap. Resume state
+lives in `audio/fetch_state.json`.
 
 ```python
 from datasets import load_dataset
@@ -476,23 +493,46 @@ def _commit_with_backoff(fn, what: str) -> None:
 
 
 def upload_pending(cfg, state: dict, seen: set[str]) -> int:
-    """Upload ALL locally-collected parquet shards in ONE folder commit, then the
-    resume state in a second commit. Sidesteps the per-commit rate limit entirely."""
+    """Pack pending tiny shards into bunch_*.parquet and upload those.
+
+    `data.bunch_size` (default 200) is the max shards per Hub file.
+    `data.bunch_max_mb` (default 1500) also caps audio bunches so a file
+    stays ~1.5 GB rather than 200 × 150 MB = 30 GB.
+    """
     from huggingface_hub import CommitOperationAdd, HfApi
+
+    from .bunch import bunch_local_parquets, list_config_parquets, next_bunch_index as _nbi
 
     pdir = pending_dir(cfg)
     files = sorted(f for f in os.listdir(pdir) if f.endswith(".parquet"))
     api = HfApi(token=require_token())
 
     if files:
-        log.info("bulk-uploading %d pending shard(s) in ONE commit…", len(files))
+        bunch_size = int(getattr(cfg.data, "bunch_size", 200))
+        bunch_max_mb = int(getattr(cfg.data, "bunch_max_mb", 1500))
+        hub_bunches, _ = list_config_parquets(cfg.repos.data, "audio", require_token())
+        start = max(int(state.get("next_bunch_index") or 0), _nbi(hub_bunches))
+        out_dir = os.path.join(cfg.paths.audio_dir, "bunches")
+        made = bunch_local_parquets(
+            [os.path.join(pdir, f) for f in files],
+            out_dir, start_index=start,
+            bunch_size=bunch_size,
+            bunch_max_bytes=bunch_max_mb * 1024 * 1024 if bunch_max_mb else 0,
+        )
+        ops = [
+            CommitOperationAdd(
+                path_in_repo=f"{HUB_SHARD_DIR}/bunch_{b['index']:05d}.parquet",
+                path_or_fileobj=b["path"],
+            )
+            for b in made
+        ]
+        log.info("uploading %d audio bunch(es) packed from %d shard(s)…", len(made), len(files))
         _commit_with_backoff(
-            lambda: api.upload_folder(
-                repo_id=cfg.repos.data, repo_type="dataset",
-                folder_path=pdir, path_in_repo=HUB_SHARD_DIR,
-                commit_message=f"bulk upload {len(files)} audio shards",
+            lambda: api.create_commit(
+                repo_id=cfg.repos.data, repo_type="dataset", operations=ops,
+                commit_message=f"audio: {len(made)} bunches from {len(files)} shards",
             ),
-            "folder upload",
+            "bunch upload",
         )
         for f in files:
             try:
@@ -500,7 +540,25 @@ def upload_pending(cfg, state: dict, seen: set[str]) -> int:
                 upsert_shard(state, idx, rows=0, uploaded=True)
             except ValueError:
                 pass
-            os.remove(os.path.join(pdir, f))
+            try:
+                os.remove(os.path.join(pdir, f))
+            except OSError:
+                pass
+        state["bunched"] = True
+        state["next_bunch_index"] = start + len(made)
+        state.setdefault("bunches", [])
+        for b in made:
+            state["bunches"].append({
+                "index": b["index"], "rows": b["rows"], "uploaded": True,
+                "hub_path": f"{HUB_SHARD_DIR}/bunch_{b['index']:05d}.parquet",
+            })
+            try:
+                os.remove(b["path"])
+            except OSError:
+                pass
+        n_sent = len(made)
+    else:
+        n_sent = 0
 
     persist_state(cfg, state, seen)
     ls, lf = local_paths(cfg.paths.audio_dir)
@@ -509,12 +567,12 @@ def upload_pending(cfg, state: dict, seen: set[str]) -> int:
             repo_id=cfg.repos.data, repo_type="dataset",
             operations=[CommitOperationAdd(path_in_repo=HUB_STATE, path_or_fileobj=ls),
                         CommitOperationAdd(path_in_repo=HUB_FPS, path_or_fileobj=lf)],
-            commit_message="update resume state after bulk upload",
+            commit_message="update resume state after bunch upload",
         ),
         "state commit",
     )
-    log.info("bulk upload complete: %d shards -> %s", len(files), cfg.repos.data)
-    return len(files)
+    log.info("bunch upload complete: %d file(s) -> %s", n_sent, cfg.repos.data)
+    return n_sent
 
 
 def stage_shard(cfg, arrow_dir: str, idx: int, *, drop_local: bool) -> tuple[str, int]:

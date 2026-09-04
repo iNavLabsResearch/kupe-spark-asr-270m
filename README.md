@@ -49,9 +49,13 @@ python scripts/01_fetch_data.py --status           # leftover local shards + Hub
 python scripts/01_fetch_data.py --hub-only         # upload leftover shards, then fetch; each shard goes to Hub immediately
 
 # --- GPU VM (empty artifacts/ is fine; scripts pull from Hub if local is missing) ---
-python scripts/02_encode_data.py --from-hub    # download `audio`, Mimi-encode, push `mimi`
+python scripts/02_encode_data.py --from-hub    # download `audio`, Mimi-encode, push bunched `mimi`
 python scripts/03_train.py                     # local `mimi` if 02 just ran; else --from-hub
 python scripts/04_evaluate.py --push
+
+# If train 429s (too many tiny parquet files on Hub):
+python scripts/06_compact_hub.py               # pack 200 shards -> 1 bunch, write local copy
+python scripts/03_train.py                     # loads the local copy, 0 Hub downloads
 ```
 
 Same box (needs enough disk for a local audio copy as well as the Hub push):
@@ -144,18 +148,19 @@ The **encode + download** dominate, not training. All GPUs above fit full fine-t
 
 ## 6. Repos & Hub data layout (on `anuj-inavlabs`)
 
-**`kupe-spark-asr-270m-data`** (dataset) — two loadable configs, sharded parquet, resumable:
+**`kupe-spark-asr-270m-data`** (dataset) — two loadable configs, bunched parquet, resumable:
 
 ```
 kupe-spark-asr-270m-data/
 ├── README.md                     # dataset card: declares the two configs below
 ├── audio/
-│   ├── data/shard_00000.parquet  # raw 24kHz mono + text, one file per shard
-│   ├── data/shard_00001.parquet  #   (uploaded live, one commit per shard)
+│   ├── data/bunch_00000.parquet  # 200 tiny shards packed into one Hub file
+│   ├── data/bunch_00001.parquet
 │   ├── fetch_state.json          # resume state: per-lang hours + shard/upload status
 │   └── seen_fps.txt              # clip fingerprints -> exact-once, dedup on resume
 └── mimi/
-    └── *.parquet                 # Mimi codebook-0 tokens + text  ← training reads this
+    ├── data/bunch_00000.parquet  # Mimi codebook-0 tokens + text  ← training reads this
+    └── encode_state.json
 ```
 
 Load either config directly — columns: `id, language, source, text, duration, split` (+`audio` or `mimi_cb0`):
@@ -179,7 +184,7 @@ kupe_asr/
   config.py hf_utils.py tokenizer.py model.py text.py
   data/ sources.py fetch.py encode.py shards.py collate.py
   train.py evaluate.py stream.py
-scripts/ 00..05         one file per stage
+scripts/ 00..06         one file per stage (06 = compact tiny Hub shards)
 ```
 
 ## 8. Notes

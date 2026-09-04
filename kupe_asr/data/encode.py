@@ -4,9 +4,10 @@ Three overlapping stages so the GPU never waits:
   [downloader thread] prefetch N audio parquet from the Hub  (bounded by disk)
         -> [decoder thread] soundfile-decode clips into GPU-ready batches
               -> [GPU] Mimi-encode cb0, write mimi shards
-                    -> [uploader thread] commit shards + delete locally (background)
+                    -> [uploader thread] pack 200 shards into bunch_*.parquet, commit, delete locally
 
 Resumable via mimi/encode_state.json (skips already-encoded audio files).
+Hub only stores bunch_*.parquet so train never 429s on thousands of tiny files.
 """
 from __future__ import annotations
 
@@ -23,6 +24,13 @@ from tqdm import tqdm
 
 from ..constants import MIMI_FRAME_RATE, MIMI_SAMPLE_RATE
 from ..hf_utils import ensure_repo, hf_token, log, require_token
+from .bunch import (
+    concat_parquets,
+    download_hub_file,
+    list_config_parquets,
+    next_bunch_index,
+    prefer_parquets,
+)
 from .fetch_state import (
     _commit_with_backoff,
     _download_hub,
@@ -32,7 +40,6 @@ from .fetch_state import (
 )
 from .sources import _decode_audio
 
-HUB_AUDIO_PREFIX = "audio/data/"
 HUB_MIMI_DIR = "mimi/data"
 HUB_MIMI_STATE = "mimi/encode_state.json"
 _DONE = object()          # sentinel
@@ -49,10 +56,8 @@ def _features():
 
 
 def _list_audio_files(repo: str, token: str) -> list[str]:
-    from huggingface_hub import HfApi
-
-    files = HfApi(token=token).list_repo_files(repo, repo_type="dataset")
-    return sorted(f for f in files if f.startswith(HUB_AUDIO_PREFIX) and f.endswith(".parquet"))
+    bunches, shards = list_config_parquets(repo, "audio", token)
+    return prefer_parquets(bunches, shards)
 
 
 def _load_state(cfg, token: str):
@@ -62,7 +67,19 @@ def _load_state(cfg, token: str):
     hub = load_json(hub_p) if hub_p else {}
     done = set(st.get("audio_files_done", [])) | set(hub.get("audio_files_done", []))
     nxt = max(int(st.get("next_mimi_index", 0)), int(hub.get("next_mimi_index", 0)))
-    return {"audio_files_done": sorted(done), "next_mimi_index": nxt}, local
+    hub_bunches, _ = list_config_parquets(cfg.repos.data, "mimi", token)
+    nxt_bunch = max(
+        int(st.get("next_bunch_index") or 0),
+        int(hub.get("next_bunch_index") or 0),
+        next_bunch_index(hub_bunches),
+    )
+    bunched = bool(st.get("bunched") or hub.get("bunched") or hub_bunches)
+    return {
+        "audio_files_done": sorted(done),
+        "next_mimi_index": nxt,
+        "next_bunch_index": nxt_bunch,
+        "bunched": bunched,
+    }, local
 
 
 def encode_status(cfg) -> dict:
@@ -81,7 +98,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     import datasets
     import torch
     from concurrent.futures import ThreadPoolExecutor
-    from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
+    from huggingface_hub import CommitOperationAdd, HfApi
 
     import time
 
@@ -110,6 +127,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     budget = int(cfg.mimi.batch_max_frames)
     shard_size = int(cfg.data.shard_size)
     files_per_chunk = int(getattr(cfg.mimi, "files_per_chunk", 5))
+    bunch_size = int(getattr(cfg.mimi, "bunch_size", 200))
     prefetch = int(getattr(cfg.mimi, "prefetch", 4))
     nd = len(devices)
     budget_total = budget * nd
@@ -141,10 +159,21 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     def frames_of(dur):
         return max(1, int(math.ceil(dur * MIMI_FRAME_RATE)))
 
-    # ---- shard writing + background upload -------------------------------
+    # ---- shard writing + background bunch upload -------------------------
+    # Tiny local shards stay RAM-cheap; Hub only ever sees bunch_*.parquet
+    # (200 shards packed together) so train never 429s again.
     buf: list = []
     mimi_idx = int(state["next_mimi_index"])
+    bunch_idx = int(state["next_bunch_index"])
     chunk_files: list[str] = []
+
+    def _snap():
+        return {
+            "audio_files_done": list(state["audio_files_done"]),
+            "next_mimi_index": int(mimi_idx),
+            "next_bunch_index": int(bunch_idx),
+            "bunched": True,
+        }
 
     def flush_shard():
         nonlocal buf, mimi_idx
@@ -157,34 +186,50 @@ def encode(cfg, *, from_hub: bool = True) -> str:
         mimi_idx += 1
         buf = []
 
-    def _do_upload(files, snap):
-        if not files or not cfg.mimi.push:
+    def _do_upload_bunch(shard_names, bunch_name, snap):
+        if not shard_names:
             return
-        tmp = os.path.join(cfg.paths.mimi_dir, f".st_{files[0]}.json")
+        srcs = [os.path.join(pending, n) for n in shard_names]
+        bunch_path = os.path.join(pending, bunch_name)
+        concat_parquets(srcs, bunch_path)
+        for p in srcs:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        if not cfg.mimi.push:
+            return
+        tmp = os.path.join(cfg.paths.mimi_dir, f".st_{bunch_name}.json")
         save_json(tmp, snap)
-        ops = [CommitOperationAdd(f"{HUB_MIMI_DIR}/{f}", os.path.join(pending, f)) for f in files]
-        ops.append(CommitOperationAdd(HUB_MIMI_STATE, tmp))
+        ops = [
+            CommitOperationAdd(f"{HUB_MIMI_DIR}/{bunch_name}", bunch_path),
+            CommitOperationAdd(HUB_MIMI_STATE, tmp),
+        ]
         _commit_with_backoff(lambda: api.create_commit(
             repo_id=cfg.repos.data, repo_type="dataset", operations=ops,
-            commit_message=f"mimi: +{len(files)} shards"), "mimi commit")
-        for f in files:
-            try: os.remove(os.path.join(pending, f))
-            except OSError: pass
-        try: os.remove(tmp)
-        except OSError: pass
+            commit_message=f"mimi: {bunch_name} ({len(shard_names)} shards packed)",
+        ), "mimi bunch commit")
+        for p in (bunch_path, tmp):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
         ensure_data_card(cfg)
-        log.info("[bg] uploaded %d mimi shards, local cleared", len(files))
+        log.info("[bg] uploaded %s (%d shards packed), local cleared",
+                 bunch_name, len(shard_names))
 
-    def submit_upload():
-        nonlocal chunk_files
-        if not chunk_files:
-            return
-        files, chunk_files = chunk_files, []
-        snap = {"audio_files_done": list(state["audio_files_done"]), "next_mimi_index": int(mimi_idx)}
-        inflight.append(up_pool.submit(_do_upload, files, snap))
-        inflight[:] = [f for f in inflight if not f.done()]
-        while len(inflight) > 2:
-            inflight.pop(0).result()
+    def submit_upload(*, force=False):
+        """Pack pending tiny shards into bunch_*.parquet. `force` flushes a short last bunch."""
+        nonlocal chunk_files, bunch_idx
+        while chunk_files and (force or len(chunk_files) >= bunch_size):
+            n = bunch_size if len(chunk_files) >= bunch_size else len(chunk_files)
+            take, chunk_files = chunk_files[:n], chunk_files[n:]
+            name = f"bunch_{bunch_idx:05d}.parquet"
+            bunch_idx += 1
+            inflight.append(up_pool.submit(_do_upload_bunch, take, name, _snap()))
+            inflight[:] = [f for f in inflight if not f.done()]
+            while len(inflight) > 2:
+                inflight.pop(0).result()
 
     # ---- GPU encode (multi-GPU, OOM auto-split) --------------------------
     def _oom(e):
@@ -242,8 +287,13 @@ def encode(cfg, *, from_hub: bool = True) -> str:
         for af in todo:
             d = tempfile.mkdtemp(dir=dl_root)
             try:
-                p = hf_hub_download(cfg.repos.data, af, repo_type="dataset", token=token, local_dir=d)
-                dlq.put((af, d, p))          # blocks when `prefetch` files are on disk
+                cached = download_hub_file(cfg.repos.data, af, token)
+                dest = os.path.join(d, os.path.basename(af))
+                try:
+                    os.symlink(cached, dest)
+                except OSError:
+                    shutil.copy2(cached, dest)
+                dlq.put((af, d, dest))          # blocks when `prefetch` files are on disk
             except Exception as e:
                 shutil.rmtree(d, ignore_errors=True)
                 log.warning("download %s failed: %s", af, e)
@@ -326,6 +376,8 @@ def encode(cfg, *, from_hub: bool = True) -> str:
         else:  # file finished
             state["audio_files_done"] = sorted(set(state["audio_files_done"]) | {item[1]})
             state["next_mimi_index"] = mimi_idx
+            state["next_bunch_index"] = bunch_idx
+            state["bunched"] = True
             save_json(local_state, state)
             processed += 1
             if devices[0].startswith("cuda"):
@@ -335,7 +387,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
                 submit_upload()
             status(force=True)
     flush_shard()
-    submit_upload()
+    submit_upload(force=True)
     for f in inflight:
         f.result()
     for pl in (gpu_pool, decode_pool, up_pool):

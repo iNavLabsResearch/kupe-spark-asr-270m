@@ -33,10 +33,15 @@ data:
   min_dur: 1.0            # drop clips shorter than this (seconds)
   max_dur: 20.0           # drop clips longer than this (seconds)
   val_minutes_per_lang: 20
-  shard_size: 500         # rows per parquet (~150MB). Kept small because the fetch box
-                          # OOMs at flush with bigger buffers. Does NOT affect encode/train.
+  shard_size: 500         # rows per local parquet (~150MB audio). Kept small because the
+                          # fetch box OOMs at flush with bigger buffers. Hub sees bunches,
+                          # not these tiny files — see bunch_size below.
+  bunch_size: 200         # tiny shards packed into each Hub parquet. Stops the 1000-req /
+                          # 5-min Hub 429 (each file = ≥1 API call). Mimi ~130KB×200 ≈ 26MB.
+  bunch_max_mb: 1500      # extra cap for audio bunches (~10×150MB). 0 = files-only.
+                          # 200 audio shards would be ~30GB per file without this.
   pending_max: 60         # safety valve: if pending/ reaches this many shards mid-language,
-                          # do an interim folder-commit + clear so disk can't blow up on a
+                          # pack+commit bunches + clear so disk can't blow up on a
                           # huge language (e.g. hi ~400h). Still ~a handful of commits/lang.
   streaming: true
   num_proc: 8
@@ -49,9 +54,9 @@ mimi:
   model_id: kyutai/mimi
   num_codebooks: 1        # codebook 0 = semantic (WavLM-distilled) -> 12.5 tok/s
   batch_max_frames: 8000  # sum-of-frames VRAM budget per encode batch (raise on big GPUs)
-  files_per_chunk: 5      # audio parquet files to download+encode before each mimi upload;
-                          # smaller = less local disk held, more commits. Encoded shards +
-                          # downloaded audio are deleted after each chunk.
+  files_per_chunk: 5      # audio parquet files to download+encode before flushing a local
+                          # mimi shard. Hub upload waits until `bunch_size` shards (or EOF).
+  bunch_size: 200         # local mimi shards packed into one Hub bunch_*.parquet
   prefetch: 16            # audio files to keep downloaded ahead (pipeline). ~1.3GB each,
                           # so 16 ≈ 20GB disk. Raise more on big disk for deeper overlap.
   push: true              # push `mimi` config after encoding
