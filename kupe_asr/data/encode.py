@@ -134,7 +134,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     os.makedirs(dl_root, exist_ok=True)
     os.makedirs(pending, exist_ok=True)
 
-    decode_pool = ThreadPoolExecutor(max_workers=8)
+    decode_pool = ThreadPoolExecutor(max_workers=12)
     gpu_pool = ThreadPoolExecutor(max_workers=nd)
     up_pool = ThreadPoolExecutor(max_workers=1)
     inflight: list = []
@@ -257,22 +257,26 @@ def encode(cfg, *, from_hub: bool = True) -> str:
             if item is _DONE:
                 break
             af, d, p = item
-            arrays, metas, frames = [], [], 0
+            clips = []                       # (array, rec) for the whole file
             try:
                 pf = pq.ParquetFile(p)
                 for b in pf.iter_batches(batch_size=64, columns=cols):
                     for arr, rec in decode_pool.map(_decode_rec, b.to_pylist()):
-                        if arr is None or not rec.get("duration"):
-                            continue
-                        nf = frames_of(rec["duration"])
-                        if arrays and frames + nf > budget_total:
-                            batchq.put(("batch", arrays, metas))
-                            arrays, metas, frames = [], [], 0
-                        arrays.append(arr); metas.append(rec); frames += nf
-                if arrays:
-                    batchq.put(("batch", arrays, metas))
+                        if arr is not None and rec.get("duration"):
+                            clips.append((arr, rec))
             finally:
                 shutil.rmtree(d, ignore_errors=True)
+            # sort by length -> near-uniform batches -> almost no padding waste
+            clips.sort(key=lambda c: len(c[0]))
+            arrays, metas, frames = [], [], 0
+            for arr, rec in clips:
+                nf = frames_of(rec["duration"])
+                if arrays and frames + nf > budget_total:
+                    batchq.put(("batch", arrays, metas))
+                    arrays, metas, frames = [], [], 0
+                arrays.append(arr); metas.append(rec); frames += nf
+            if arrays:
+                batchq.put(("batch", arrays, metas))
             batchq.put(("file", af))
         batchq.put(_DONE)
 
