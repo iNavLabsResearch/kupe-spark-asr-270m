@@ -33,10 +33,11 @@ data:
   min_dur: 1.0            # drop clips shorter than this (seconds)
   max_dur: 20.0           # drop clips longer than this (seconds)
   val_minutes_per_lang: 20
-  shard_size: 2000        # rows per parquet (~600MB). Bigger = fewer files; ONLY limited
-                          # by flush RAM (writer buffers a whole shard: ~0.3MB/row peak).
-                          # Does NOT affect encode/train (both glob all parquet). Drop to
-                          # 1000/500 only if the fetch box has < ~4GB RAM and OOMs.
+  shard_size: 500         # rows per parquet (~150MB). Kept small because the fetch box
+                          # OOMs at flush with bigger buffers. Does NOT affect encode/train.
+  pending_max: 60         # safety valve: if pending/ reaches this many shards mid-language,
+                          # do an interim folder-commit + clear so disk can't blow up on a
+                          # huge language (e.g. hi ~400h). Still ~a handful of commits/lang.
   streaming: true
   num_proc: 8
   push: true              # 01 collects shards locally, uploads in batches; resume via fetch_state.json

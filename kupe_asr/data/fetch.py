@@ -241,6 +241,9 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False, defer_upload: boo
 
     # Per-language upload: shards collect in pending/ during a language, then get
     # pushed as ONE folder commit when that language finishes (and pending is cleared).
+    # A pending_max safety valve does an interim commit so disk can't blow up mid-language.
+    pending_max = int(getattr(cfg.data, "pending_max", 60))
+
     def on_flush(arrow_dir: str, idx: int, nrows: int) -> None:
         upsert_shard(state, idx, nrows, uploaded=False)
         persist_state(cfg, state, seen)
@@ -251,6 +254,11 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False, defer_upload: boo
         where = "upload later with --upload-only" if defer_upload else "upload after this language"
         log.info("shard_%05d (%d rows) -> pending/ (%s)", idx, nrows, where)
         _free_memory()
+        if not defer_upload and pending_max > 0:
+            n_pend = len([f for f in os.listdir(pending_dir(cfg)) if f.endswith(".parquet")])
+            if n_pend >= pending_max:
+                log.info("pending/ hit %d shards -> interim folder commit (frees disk)", n_pend)
+                upload_pending(cfg, state, seen)
 
     writer = ShardWriter(
         shards_dir, _features(target_sr), int(cfg.data.shard_size),
