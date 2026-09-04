@@ -615,7 +615,8 @@ def compact_hub_config(
 def write_local_dataset(cfg, config_name: str, parquet_paths: list[str]) -> str:
     """Materialize a `save_to_disk` dataset so train skips the Hub entirely."""
     dest = os.path.join(getattr(cfg.paths, f"{config_name}_dir"), "dataset")
-    log.info("writing local %s dataset (%d parquet) -> %s", config_name, len(parquet_paths), dest)
+    log.info("writing local %s via pyarrow (NOT load_dataset) (%d parquet) -> %s",
+             config_name, len(parquet_paths), dest)
     ds = dataset_from_parquets(parquet_paths)
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     if os.path.isdir(dest):
