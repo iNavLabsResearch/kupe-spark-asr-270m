@@ -117,9 +117,9 @@ def _index_and_upload_local(cfg, state: dict, seen: set[str], hub_indices: set[i
         if not push:
             log.info("shard_%05d local only (--no-push)", idx)
             continue
-        log.info("uploading leftover local shard_%05d first…", idx)
-        upload_arrow_shard(cfg, state, seen, idx, path, drop_local=hub_only)
-        hub_indices.add(idx)
+        # stage only; _recover_parquet_tmp commits leftovers in ONE batched commit
+        log.info("staging leftover local shard_%05d for batched upload…", idx)
+        stage_shard(cfg, path, idx, drop_local=hub_only)
 
     persist_state(cfg, state, seen)
 
