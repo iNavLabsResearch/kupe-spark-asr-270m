@@ -4,7 +4,7 @@ CPU VM:  01_fetch_data.py --hub-only   -> push `audio`
 GPU VM:  02_encode_data.py             -> pulls `audio` if local is empty, pushes `mimi`
 GPU VM:  03_train.py                   -> pulls `mimi` if local is empty
 
-Hub files are `bunch_*.parquet` (200 tiny shards packed together). Older
+Hub files are `bunch_*.parquet` (1000 tiny shards packed together). Older
 `shard_*.parquet` dumps 429 the free-tier Hub (1000 req / 5 min) — compact
 those first with `python scripts/06_compact_hub.py`.
 """

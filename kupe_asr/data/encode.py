@@ -4,7 +4,7 @@ Three overlapping stages so the GPU never waits:
   [downloader thread] prefetch N audio parquet from the Hub  (bounded by disk)
         -> [decoder thread] soundfile-decode clips into GPU-ready batches
               -> [GPU] Mimi-encode cb0, write mimi shards
-                    -> [uploader thread] pack 200 shards into bunch_*.parquet, commit, delete locally
+                    -> [uploader thread] pack 1000 shards into bunch_*.parquet, commit, delete locally
 
 Resumable via mimi/encode_state.json (skips already-encoded audio files).
 Hub only stores bunch_*.parquet so train never 429s on thousands of tiny files.
@@ -127,7 +127,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
     budget = int(cfg.mimi.batch_max_frames)
     shard_size = int(cfg.data.shard_size)
     files_per_chunk = int(getattr(cfg.mimi, "files_per_chunk", 5))
-    bunch_size = int(getattr(cfg.mimi, "bunch_size", 200))
+    bunch_size = int(getattr(cfg.mimi, "bunch_size", 1000))
     prefetch = int(getattr(cfg.mimi, "prefetch", 4))
     nd = len(devices)
     budget_total = budget * nd
@@ -161,7 +161,7 @@ def encode(cfg, *, from_hub: bool = True) -> str:
 
     # ---- shard writing + background bunch upload -------------------------
     # Tiny local shards stay RAM-cheap; Hub only ever sees bunch_*.parquet
-    # (200 shards packed together) so train never 429s again.
+    # (1000 shards packed together) so train never 429s again.
     buf: list = []
     mimi_idx = int(state["next_mimi_index"])
     bunch_idx = int(state["next_bunch_index"])

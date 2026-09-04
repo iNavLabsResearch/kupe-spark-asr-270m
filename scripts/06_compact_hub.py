@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-"""Pack ~200 tiny Hub parquet files into 1 bunch so training does not 429.
+"""Pack ~1000 tiny Hub parquet files into 1 bunch so training does not 429.
 
 The free Hub quota is 1000 API requests / 5 minutes. `03_train.py --from-hub`
 was downloading ~1000 mimi shard_*.parquet files and getting rate-limited.
 
-Run this on the GPU VM (the failed train already cached almost every file,
-so compact is concat + upload, not a 5-minute wait):
+On 429 this script sleeps 5 minutes and retries. Cached files from the failed
+train run cost 0 API calls.
 
     python scripts/06_compact_hub.py                 # mimi (unblocks train)
     python scripts/03_train.py                       # uses the local copy just written
@@ -30,7 +30,7 @@ def main():
     ap.add_argument("--audio", action="store_true",
                     help="also compact audio/data (size-capped bunches, ~1.5 GB each)")
     ap.add_argument("--bunch-size", type=int, default=DEFAULT_BUNCH_SIZE,
-                    help="tiny shards packed into each Hub file (default 200)")
+                    help="tiny shards packed into each Hub file (default 1000)")
     ap.add_argument("--bunch-max-mb", type=int, default=DEFAULT_BUNCH_MAX_MB,
                     help="audio bunch size cap in MB (default 1500). 0 = files-only")
     ap.add_argument("--no-local", action="store_true",

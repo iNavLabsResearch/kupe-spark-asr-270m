@@ -2,7 +2,7 @@
 
 Free-tier Hub allows 1000 API requests / 5 minutes. Each parquet download is
 at least one request, so ~1000 shard_*.parquet files 429 before training
-starts. Bunching 200 shards -> 1 file drops mimi from ~1000 requests to ~5.
+starts. Bunching 1000 shards -> 1 file drops mimi from ~1000 requests to 1.
 
 Used by:
   scripts/06_compact_hub.py   one-shot rewrite of an existing Hub config
@@ -20,8 +20,10 @@ from ..hf_utils import log, require_token
 BUNCH_PREFIX = "bunch_"
 SHARD_PREFIX = "shard_"
 TINY_FILE_LIMIT = 200          # more tiny shards than this -> compact first (load.py)
-DEFAULT_BUNCH_SIZE = 200       # shards per Hub file
-DEFAULT_BUNCH_MAX_MB = 1500    # audio cap so a bunch stays ~1.5 GB, not 30 GB
+DEFAULT_BUNCH_SIZE = 1000      # shards per Hub file (one Hub quota window)
+DEFAULT_BUNCH_MAX_MB = 1500    # audio cap so a bunch stays ~1.5 GB, not 150 GB
+HF_QUOTA_WINDOW_S = 300        # free-tier Hub: 1000 API requests / 5 minutes
+HF_QUOTA_SOFT = 900            # sleep before we actually hit 1000
 
 
 def data_prefix(config_name: str) -> str:
@@ -167,7 +169,27 @@ def _is_rate_limit(err: BaseException) -> bool:
 
 
 def download_hub_file(repo_id: str, path_in_repo: str, token: str) -> str:
-    """hf_hub_download with cache-first + 429 backoff. Cached files are 0 API calls."""
+    """hf_hub_download with cache-first. On 429, sleep 5 min for the Hub quota reset."""
+    from huggingface_hub import hf_hub_download
+
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    hit = _try_cache(repo_id, path_in_repo, token)
+    if hit:
+        return hit
+    while True:
+        try:
+            return hf_hub_download(
+                repo_id, path_in_repo, repo_type="dataset", token=token,
+            )
+        except Exception as e:
+            if not _is_rate_limit(e):
+                raise
+            log.warning("Hub 429 on %s — sleeping 5 min for quota reset, then retry",
+                        path_in_repo)
+            time.sleep(HF_QUOTA_WINDOW_S)
+
+
+def _try_cache(repo_id: str, path_in_repo: str, token: str) -> str | None:
     from huggingface_hub import hf_hub_download
 
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -176,32 +198,28 @@ def download_hub_file(repo_id: str, path_in_repo: str, token: str) -> str:
             repo_id, path_in_repo, repo_type="dataset", token=token, local_files_only=True,
         )
     except Exception:
-        pass
-    delays = [0, 10, 30, 60, 120, 300]
-    last = None
-    for attempt, delay in enumerate(delays):
-        if delay:
-            log.warning("download backoff %ds for %s (attempt %d/%d)",
-                        delay, path_in_repo, attempt + 1, len(delays))
-            time.sleep(delay)
-        try:
-            return hf_hub_download(
-                repo_id, path_in_repo, repo_type="dataset", token=token,
-            )
-        except Exception as e:
-            last = e
-            if not _is_rate_limit(e) or attempt == len(delays) - 1:
-                raise
-    raise last  # pragma: no cover
+        return None
 
 
 def download_many(repo_id: str, paths: list[str], token: str) -> list[str]:
-    """Resolve Hub parquet paths. Already-cached files (the failed train run) are instant."""
+    """Resolve Hub parquet paths. Cache hits are free; every 900 network downloads
+    we sleep 5 min so we never trip the 1000-req quota."""
     local: list[str] = []
+    net = 0
     for i, p in enumerate(paths, 1):
-        local.append(download_hub_file(repo_id, p, token))
+        hit = _try_cache(repo_id, p, token)
+        if hit:
+            local.append(hit)
+        else:
+            if net > 0 and net % HF_QUOTA_SOFT == 0:
+                log.info("downloaded %d files this window — sleeping 5 min to reset Hub quota…",
+                         net)
+                time.sleep(HF_QUOTA_WINDOW_S)
+            local.append(download_hub_file(repo_id, p, token))
+            net += 1
         if i == 1 or i % 50 == 0 or i == len(paths):
-            log.info("resolved %d/%d  (%s)", i, len(paths), p)
+            log.info("resolved %d/%d (%d cache, %d network)  (%s)",
+                     i, len(paths), i - net, net, p)
     return local
 
 

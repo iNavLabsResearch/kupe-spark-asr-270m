@@ -1,7 +1,7 @@
 """Stage 1 — stream sources, shard, pack into bunches, upload, resume later.
 
 Local flush is still tiny `shard_*.parquet` (RAM-safe). Hub only ever sees
-`bunch_*.parquet` (200 shards packed, audio also capped at ~1.5 GB) so
+`bunch_*.parquet` (1000 shards packed, audio also capped at ~1.5 GB) so
 encode/train never 429 the free-tier 1000-request / 5-minute cap.
 """
 from __future__ import annotations

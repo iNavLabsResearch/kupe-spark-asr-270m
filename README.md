@@ -54,7 +54,7 @@ python scripts/03_train.py                     # local `mimi` if 02 just ran; el
 python scripts/04_evaluate.py --push
 
 # If train 429s (too many tiny parquet files on Hub):
-python scripts/06_compact_hub.py               # pack 200 shards -> 1 bunch, write local copy
+python scripts/06_compact_hub.py               # pack 1000 shards -> 1 bunch, write local copy
 python scripts/03_train.py                     # loads the local copy, 0 Hub downloads
 ```
 
@@ -154,7 +154,7 @@ The **encode + download** dominate, not training. All GPUs above fit full fine-t
 kupe-spark-asr-270m-data/
 ├── README.md                     # dataset card: declares the two configs below
 ├── audio/
-│   ├── data/bunch_00000.parquet  # 200 tiny shards packed into one Hub file
+│   ├── data/bunch_00000.parquet  # 1000 tiny shards packed into one Hub file
 │   ├── data/bunch_00001.parquet
 │   ├── fetch_state.json          # resume state: per-lang hours + shard/upload status
 │   └── seen_fps.txt              # clip fingerprints -> exact-once, dedup on resume

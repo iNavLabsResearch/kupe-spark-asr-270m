@@ -312,7 +312,7 @@ def print_status(state: dict, caps, hub_indices: set[int]) -> None:
     n_bunch = len(state.get("bunches") or [])
     log.info("  Hub parquet shards: %s", on_hub[:8] + (["…", on_hub[-1]] if len(on_hub) > 8 else on_hub[8:]))
     if n_bunch or state.get("bunched"):
-        log.info("  Hub bunches: %d (tiny shards packed 200-to-1)", n_bunch)
+        log.info("  Hub bunches: %d (tiny shards packed 1000-to-1)", n_bunch)
     log.info("  local shards still to upload: %s", [int(s["index"]) for s in local_pending] or "none")
     log.info("================================")
 
@@ -346,7 +346,7 @@ Languages: {langs}
 - **audio** — raw speech resampled to 24 kHz mono (`audio/data/bunch_*.parquet`).
 - **mimi** — Mimi codebook-0 tokens (12.5 tok/s) + transcripts (`mimi/data/bunch_*.parquet`). Used for training.
 
-Tiny `shard_*.parquet` files are packed 200-to-1 into `bunch_*.parquet` so Hub
+Tiny `shard_*.parquet` files are packed 1000-to-1 into `bunch_*.parquet` so Hub
 downloads stay under the free-tier 1000-request / 5-minute cap. Resume state
 lives in `audio/fetch_state.json`.
 
@@ -477,10 +477,11 @@ def stage_to_pending(cfg, arrow_dir: str, idx: int, *, drop_local: bool) -> tupl
 
 
 def _commit_with_backoff(fn, what: str) -> None:
-    delays = [0, 30, 120, 300, 900, 1800]
+    delays = [0, 300, 300, 300, 600]   # 5 min Hub quota window, then retry
     for attempt, delay in enumerate(delays):
         if delay:
-            log.warning("%s backoff %ds (attempt %d/%d)…", what, delay, attempt + 1, len(delays))
+            log.warning("%s Hub 429 — sleeping %ds for quota reset (attempt %d/%d)…",
+                        what, delay, attempt + 1, len(delays))
             time.sleep(delay)
         try:
             fn()
@@ -495,9 +496,9 @@ def _commit_with_backoff(fn, what: str) -> None:
 def upload_pending(cfg, state: dict, seen: set[str]) -> int:
     """Pack pending tiny shards into bunch_*.parquet and upload those.
 
-    `data.bunch_size` (default 200) is the max shards per Hub file.
+    `data.bunch_size` (default 1000) is the max shards per Hub file.
     `data.bunch_max_mb` (default 1500) also caps audio bunches so a file
-    stays ~1.5 GB rather than 200 × 150 MB = 30 GB.
+    stays ~1.5 GB rather than 1000 × 150 MB = 150 GB.
     """
     from huggingface_hub import CommitOperationAdd, HfApi
 
@@ -508,7 +509,7 @@ def upload_pending(cfg, state: dict, seen: set[str]) -> int:
     api = HfApi(token=require_token())
 
     if files:
-        bunch_size = int(getattr(cfg.data, "bunch_size", 200))
+        bunch_size = int(getattr(cfg.data, "bunch_size", 1000))
         bunch_max_mb = int(getattr(cfg.data, "bunch_max_mb", 1500))
         hub_bunches, _ = list_config_parquets(cfg.repos.data, "audio", require_token())
         start = max(int(state.get("next_bunch_index") or 0), _nbi(hub_bunches))
@@ -604,7 +605,7 @@ def commit_batch(cfg, state: dict, seen: set[str], staged: list[tuple[int, str, 
     api = HfApi(token=require_token())
     lo, hi = staged[0][0], staged[-1][0]
     msg = f"audio shards {lo:05d}..{hi:05d} ({len(staged)} files)"
-    delays = [0, 30, 120, 300, 900, 1800]
+    delays = [0, 300, 300, 300, 600]   # 5 min Hub quota window, then retry
     for attempt, delay in enumerate(delays):
         if delay:
             log.warning("commit backoff %ds (attempt %d/%d)…", delay, attempt + 1, len(delays))

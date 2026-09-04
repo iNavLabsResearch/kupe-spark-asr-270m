@@ -30,7 +30,7 @@ def main():
     )
     ap.add_argument(
         "--upload-only", action="store_true",
-        help="pack pending/ shards into bunch_*.parquet (200 per file, size-capped) and upload, then exit",
+        help="pack pending/ shards into bunch_*.parquet (1000 per file, size-capped) and upload, then exit",
     )
     ap.add_argument(
         "--status", action="store_true",

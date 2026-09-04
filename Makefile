@@ -31,7 +31,7 @@ encode:
 encode-hub:
 	python scripts/02_encode_data.py --from-hub
 
-# pack 200 tiny Hub parquet files into 1 bunch (fixes 429 Too Many Requests)
+# pack 1000 tiny Hub parquet files into 1 bunch (fixes 429 Too Many Requests)
 compact:
 	python scripts/06_compact_hub.py
 
