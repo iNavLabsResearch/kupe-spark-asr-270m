@@ -219,21 +219,18 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
             continue
 
         dups = 0
-        active = iters[:]
         pbar = tqdm(total=cap_s / 3600.0, initial=got_s / 3600.0, unit="h",
                     desc=f"fetch {lang} ({LANGUAGES[lang]})",
                     bar_format="{l_bar}{bar}| {n:.2f}/{total:.1f}h "
                                "[{elapsed}<{remaining}] {postfix}")
-        while active and got_s < cap_s:
-            for entry in list(active):
-                if got_s >= cap_s:
-                    break
-                name, it = entry
+        for name, it in iters:                # drain one source fully before the next
+            if got_s >= cap_s:
+                break
+            while got_s < cap_s:
                 try:
                     array, sr, text, file_idx = next(it)
                 except StopIteration:
-                    active.remove(entry)
-                    continue
+                    break
                 except Exception as e:
                     log.debug("next() error %s/%s: %s", name, lang, e)
                     continue
@@ -242,6 +239,7 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
                     files_done[name] = int(file_idx)
                     st["files_done"] = files_done
                     persist_state(cfg, state, seen)
+                    _free_memory()
                     continue
 
                 if not is_probably_valid(text):
@@ -294,7 +292,8 @@ def fetch(cfg, *, hub_only: bool = False, reset: bool = False) -> str:
         st["next_clip_index"] = n
         st["by_source"] = by_src
         st["files_done"] = files_done
-        st["status"] = "done" if got_s >= cap_s or not active else "in_progress"
+        # reached here = cap hit or all sources exhausted -> nothing more to fetch
+        st["status"] = "done"
         persist_state(cfg, state, seen)
         log.info("lang %s: kept %.1f h (%d clips, %.1f min val) | by source: %s | %s",
                  lang, got_s / 3600, st["n_clips"], val_s / 60, by_src, st["status"])

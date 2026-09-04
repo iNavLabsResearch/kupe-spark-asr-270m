@@ -177,17 +177,23 @@ def iter_examples(source: Source, lang: str, token: str, start_file: int = 0) ->
     at a time to a temp dir and deleted after use -> bounded RAM + disk.
     """
     import os
+    import shutil
     import tempfile
 
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
+
+    # download to DISK, never /tmp (often tmpfs = RAM on containers -> OOM)
+    dl_root = os.environ.get("KUPE_DL_DIR") or os.path.join(os.getcwd(), ".kupe_dl")
+    os.makedirs(dl_root, exist_ok=True)
 
     cfg, files = _resolve_files(source, lang, token)
     log.info("open %s [%s]: %d parquet files, start at %d (lang=%s)",
              source.name, cfg, len(files), start_file, lang)
 
     for i in range(start_file, len(files)):
-        with tempfile.TemporaryDirectory() as tmp:
+        tmp = tempfile.mkdtemp(dir=dl_root)
+        try:
             try:
                 local = hf_hub_download(source.hf_id, files[i], repo_type="dataset",
                                         token=token, local_dir=tmp)
@@ -201,7 +207,8 @@ def iter_examples(source: Source, lang: str, token: str, start_file: int = 0) ->
                 if not audio_col or not text_col:
                     log.warning("cols not found in %s (audio=%s text=%s)", files[i], audio_col, text_col)
                 else:
-                    for batch in pf.iter_batches(batch_size=64):
+                    cols = [audio_col, text_col]
+                    for batch in pf.iter_batches(batch_size=32, columns=cols):
                         for rec in batch.to_pylist():
                             try:
                                 text = rec.get(text_col)
@@ -216,4 +223,6 @@ def iter_examples(source: Source, lang: str, token: str, start_file: int = 0) ->
                                 continue
             except Exception as e:
                 log.warning("read %s failed: %s", files[i], e)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
         yield None, None, None, i + 1        # file i done -> caller sets files_done=i+1
