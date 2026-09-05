@@ -66,10 +66,12 @@ def _pieces(text: str) -> list[str]:
     return [p.replace("▁", " ") for p in _ASR.tok.convert_ids_to_tokens(ids)]
 
 
-def _process(pcm: np.ndarray, sr: int, lang: str) -> tuple[list, float]:
+STEP_EVERY_MS = float(os.environ.get("STEP_EVERY_MS", "700"))  # throttle decode on CPU
+
+
+def _step(lang: str) -> tuple[list, float]:
     t0 = time.perf_counter()
-    _ASR.add_audio(pcm, sr)
-    events = _ASR.step(lang=lang)
+    events = _ASR.step(lang=lang)          # the expensive part (encode + generate)
     return events, (time.perf_counter() - t0) * 1000.0
 
 
@@ -84,6 +86,7 @@ async def ws(sock: WebSocket):
     async with _LOCK:
         _ASR.reset()
         sr, lang = 16000, "auto"
+        accum_ms = 0.0
         loop = asyncio.get_event_loop()
         try:
             while True:
@@ -96,14 +99,20 @@ async def ws(sock: WebSocket):
                     sr = int(cfg.get("sample_rate", sr))
                     lang = str(cfg.get("lang", lang))
                     _ASR.reset()
+                    accum_ms = 0.0
                     await sock.send_json({"type": "ready", "sample_rate": sr, "lang": lang})
                     continue
                 data = msg.get("bytes")
                 if not data:
                     continue
                 pcm = np.frombuffer(data, dtype=np.float32)
-                events, server_ms = await loop.run_in_executor(None, _process, pcm, sr, lang)
-                audio_ms = len(pcm) / sr * 1000.0
+                _ASR.add_audio(pcm, sr)                          # cheap: buffer the audio
+                accum_ms += len(pcm) / sr * 1000.0
+                if accum_ms < STEP_EVERY_MS:                     # throttle the expensive decode
+                    continue
+                audio_ms = accum_ms
+                accum_ms = 0.0
+                events, server_ms = await loop.run_in_executor(None, _step, lang)
                 for ev in events:
                     await sock.send_json({
                         "type": ev.type, "text": ev.text, "language": ev.language,
