@@ -1,43 +1,48 @@
-import React, { useCallback, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 
+const DEFAULT_SERVER = "137.184.140.206:8000";
 const LANGS = ["auto", "en", "hi", "gu", "bn", "ur", "mr"];
 
-// deterministic colour per token piece (tokenizer-style)
 function hue(s) {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360;
   return h;
 }
-function Tokens({ tokens }) {
-  if (!tokens || !tokens.length) return null;
-  return (
-    <span>
-      {tokens.map((t, i) => (
-        <span
-          key={i}
-          style={{
-            background: `hsl(${hue(t)} 70% 88%)`,
-            color: "#111",
-            borderRadius: 4,
-            padding: "1px 3px",
-            marginRight: 2,
-            whiteSpace: "pre",
-          }}
-        >
-          {t}
-        </span>
-      ))}
-    </span>
-  );
+
+function Tokens({ tokens, text }) {
+  if (tokens?.length) {
+    return (
+      <span>
+        {tokens.map((t, i) => (
+          <span
+            key={i}
+            className="token"
+            style={{
+              background: `hsl(${hue(t)} 40% 18%)`,
+              color: `hsl(${hue(t)} 72% 82%)`,
+            }}
+          >
+            {t}
+          </span>
+        ))}
+      </span>
+    );
+  }
+  return <span>{text || ""}</span>;
+}
+
+function fmtMs(n) {
+  if (n == null || Number.isNaN(n)) return "—";
+  return `${Math.round(n)} ms`;
 }
 
 export default function App() {
-  const [ip, setIp] = useState("");             // e.g. 203.0.113.5:8000
+  const [ip, setIp] = useState(DEFAULT_SERVER);
   const [lang, setLang] = useState("auto");
   const [connected, setConnected] = useState(false);
   const [listening, setListening] = useState(false);
   const [partial, setPartial] = useState({ tokens: [], text: "", language: "" });
-  const [finals, setFinals] = useState([]);
+  const [chunks, setChunks] = useState([]);
   const [lat, setLat] = useState({ server: 0, e2e: 0, audio: 0 });
   const [status, setStatus] = useState("idle");
 
@@ -46,10 +51,32 @@ export default function App() {
   const nodeRef = useRef(null);
   const streamRef = useRef(null);
   const lastSendRef = useRef(0);
+  const leftRef = useRef(null);
+  const rightRef = useRef(null);
+  const idRef = useRef(0);
 
   const wsUrl = () => {
     let s = ip.trim().replace(/^wss?:\/\//, "").replace(/\/ws$/, "");
     return `ws://${s}/ws`;
+  };
+
+  const pushChunk = (m, e2e, live) => {
+    const row = {
+      id: ++idRef.current,
+      text: m.text || "",
+      tokens: m.tokens || [],
+      language: m.language || "",
+      server: m.server_ms,
+      e2e: Math.round(e2e),
+      audio: m.audio_ms,
+      live,
+    };
+    setChunks((prev) => {
+      if (prev.length && prev[prev.length - 1].live) {
+        return [...prev.slice(0, -1), { ...row, id: prev[prev.length - 1].id }];
+      }
+      return [...prev, row];
+    });
   };
 
   const connect = useCallback(() => {
@@ -62,7 +89,11 @@ export default function App() {
       setStatus("connected");
       ws.send(JSON.stringify({ sample_rate: ctxRef.current?.sampleRate || 16000, lang }));
     };
-    ws.onclose = () => { setConnected(false); setStatus("disconnected"); stopMic(); };
+    ws.onclose = () => {
+      setConnected(false);
+      setStatus("disconnected");
+      stopMic();
+    };
     ws.onerror = () => setStatus("ws error — check ip/port & that server is on http (ws)");
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
@@ -70,12 +101,13 @@ export default function App() {
       if (m.type === "partial") {
         setPartial({ tokens: m.tokens, text: m.text, language: m.language });
         setLat({ server: m.server_ms, e2e: Math.round(e2e), audio: m.audio_ms });
+        pushChunk(m, e2e, true);
       } else if (m.type === "pre_hit_llm") {
-        setStatus(`⚡ prefetch-LLM [${m.language}]`);
+        setStatus(`prefetch-LLM [${m.language}]`);
       } else if (m.type === "end_of_speech") {
-        setFinals((f) => [{ text: m.text, tokens: m.tokens, language: m.language }, ...f].slice(0, 50));
         setPartial({ tokens: [], text: "", language: "" });
         setLat({ server: m.server_ms, e2e: Math.round(e2e), audio: m.audio_ms });
+        pushChunk(m, e2e, false);
       } else if (m.type === "ready") {
         setStatus(`ready · ${m.sample_rate}Hz · ${m.lang}`);
       } else if (m.type === "error") {
@@ -84,7 +116,10 @@ export default function App() {
     };
   }, [ip, lang]);
 
-  const disconnect = () => { stopMic(); wsRef.current?.close(); };
+  const disconnect = () => {
+    stopMic();
+    wsRef.current?.close();
+  };
 
   const startMic = useCallback(async () => {
     const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
@@ -94,19 +129,20 @@ export default function App() {
     });
     streamRef.current = stream;
     const src = ctx.createMediaStreamSource(stream);
-    const node = ctx.createScriptProcessor(4096, 1, 1);   // ~256ms chunks @16kHz
+    const node = ctx.createScriptProcessor(4096, 1, 1);
     nodeRef.current = node;
     node.onaudioprocess = (ev) => {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== 1) return;
-      const f32 = new Float32Array(ev.inputBuffer.getChannelData(0)); // copy
+      const f32 = new Float32Array(ev.inputBuffer.getChannelData(0));
       lastSendRef.current = performance.now();
       ws.send(f32.buffer);
     };
     const mute = ctx.createGain();
-    mute.gain.value = 0;                                   // don't echo yourself
-    src.connect(node); node.connect(mute); mute.connect(ctx.destination);
-    // tell server the real sample rate (browsers may ignore 16000)
+    mute.gain.value = 0;
+    src.connect(node);
+    node.connect(mute);
+    mute.connect(ctx.destination);
     wsRef.current?.send(JSON.stringify({ sample_rate: ctx.sampleRate, lang }));
     setListening(true);
     setStatus(`listening · ${ctx.sampleRate}Hz`);
@@ -116,62 +152,147 @@ export default function App() {
     nodeRef.current?.disconnect();
     streamRef.current?.getTracks().forEach((t) => t.stop());
     ctxRef.current?.close().catch(() => {});
-    nodeRef.current = null; ctxRef.current = null; streamRef.current = null;
+    nodeRef.current = null;
+    ctxRef.current = null;
+    streamRef.current = null;
     setListening(false);
   };
 
-  const box = { border: "1px solid #ddd", borderRadius: 8, padding: 14, margin: "10px 0" };
-  return (
-    <div style={{ fontFamily: "system-ui, sans-serif", maxWidth: 820, margin: "24px auto", padding: 12 }}>
-      <h2>kupe-spark-asr-270m · live streaming ASR</h2>
+  const clearChat = () => {
+    setChunks([]);
+    setPartial({ tokens: [], text: "", language: "" });
+    setLat({ server: 0, e2e: 0, audio: 0 });
+    idRef.current = 0;
+  };
 
-      <div style={box}>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+  const finals = chunks.filter((c) => !c.live);
+  const fullText = [finals.map((c) => c.text).filter(Boolean).join(" "), partial.text]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+
+  useEffect(() => {
+    if (leftRef.current) leftRef.current.scrollTop = leftRef.current.scrollHeight;
+    if (rightRef.current) rightRef.current.scrollTop = rightRef.current.scrollHeight;
+  }, [chunks, partial.text]);
+
+  const dotClass = connected ? "on" : status.includes("connecting") ? "wait" : "off";
+
+  return (
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          <img src="/brand/kupe-mark.svg" alt="Kupe" />
+          <div className="brand-copy">
+            <span className="wordmark">kupe</span>
+            <span className="product">Spark ASR 270M · live</span>
+          </div>
+        </div>
+
+        <div className="controls">
+          <span className={`dot ${dotClass}`} title={status} />
           <input
-            style={{ flex: 1, minWidth: 220, padding: 8, fontSize: 14 }}
-            placeholder="server ip:port  (e.g. 203.0.113.5:8000)"
+            className="field server"
+            placeholder="server ip:port"
             value={ip}
             onChange={(e) => setIp(e.target.value)}
             disabled={connected}
           />
-          <select value={lang} onChange={(e) => setLang(e.target.value)}>
-            {LANGS.map((l) => <option key={l} value={l}>{l}</option>)}
+          <select className="field lang" value={lang} onChange={(e) => setLang(e.target.value)}>
+            {LANGS.map((l) => (
+              <option key={l} value={l}>
+                {l}
+              </option>
+            ))}
           </select>
-          {!connected
-            ? <button onClick={connect}>Connect</button>
-            : <button onClick={disconnect}>Disconnect</button>}
-          {connected && (listening
-            ? <button onClick={stopMic}>■ Stop mic</button>
-            : <button onClick={startMic}>● Start mic</button>)}
+          {!connected ? (
+            <button className="btn" onClick={connect}>
+              Connect
+            </button>
+          ) : (
+            <button className="btn btn-danger" onClick={disconnect}>
+              Disconnect
+            </button>
+          )}
+          {connected &&
+            (listening ? (
+              <button className="btn btn-stop" onClick={stopMic}>
+                Stop mic
+              </button>
+            ) : (
+              <button className="btn btn-mic" onClick={startMic}>
+                Start mic
+              </button>
+            ))}
+          <button className="btn btn-ghost" onClick={clearChat} disabled={!chunks.length && !partial.text}>
+            Clear
+          </button>
         </div>
-        <div style={{ marginTop: 8, fontSize: 13, color: "#555" }}>status: {status}</div>
+      </header>
+
+      <div className="stats">
+        <span>
+          server <b>{fmtMs(lat.server)}</b>
+        </span>
+        <span>
+          end-to-end <b>{fmtMs(lat.e2e)}</b>
+        </span>
+        <span>
+          chunk audio <b>{fmtMs(lat.audio)}</b>
+        </span>
+        <span className="status">{status}</span>
       </div>
 
-      <div style={box}>
-        <div style={{ display: "flex", gap: 18, fontSize: 13, color: "#333" }}>
-          <span>server compute: <b>{lat.server} ms</b></span>
-          <span>end-to-end: <b>{lat.e2e} ms</b></span>
-          <span>chunk audio: <b>{lat.audio} ms</b></span>
-        </div>
-      </div>
-
-      <div style={box}>
-        <div style={{ fontSize: 12, color: "#888", marginBottom: 6 }}>
-          live (partial) {partial.language && `· ${partial.language}`}
-        </div>
-        <div style={{ minHeight: 40, fontSize: 20, lineHeight: 1.9 }}>
-          <Tokens tokens={partial.tokens} />
-        </div>
-      </div>
-
-      <div style={box}>
-        <div style={{ fontSize: 12, color: "#888", marginBottom: 6 }}>finalized turns</div>
-        {finals.map((f, i) => (
-          <div key={i} style={{ padding: "6px 0", borderBottom: "1px solid #f0f0f0" }}>
-            <span style={{ fontSize: 11, color: "#999", marginRight: 6 }}>[{f.language}]</span>
-            <Tokens tokens={f.tokens} />
+      <div className="workspace">
+        <section className="pane">
+          <div className="pane-head">
+            <h2>Chunks</h2>
+            <span className="pane-count">{chunks.length}</span>
           </div>
-        ))}
+          <div className="scroll" ref={leftRef}>
+            {!chunks.length && <div className="empty">Speak after connecting — each decode lands here with latency.</div>}
+            {chunks.map((c, i) => (
+              <div key={c.id} className={`chunk${c.live ? " live" : ""}`}>
+                <span className="chunk-n">{i + 1}</span>
+                <div className="chunk-body">
+                  <div className="chunk-meta">
+                    {c.language && <span className="lang-tag">{c.language}</span>}
+                    {c.live && <span className="live-tag">live</span>}
+                  </div>
+                  <Tokens tokens={c.tokens} text={c.text} />
+                </div>
+                <div className="lat">
+                  <span className="lat-ms">{fmtMs(c.server)}</span>
+                  <span className="lat-sub">e2e {fmtMs(c.e2e)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="pane">
+          <div className="pane-head">
+            <h2>Full transcript</h2>
+            <button className="btn btn-ghost" onClick={clearChat} disabled={!chunks.length && !partial.text}>
+              Clear chat
+            </button>
+          </div>
+          <div className="scroll" ref={rightRef}>
+            {!fullText ? (
+              <div className="empty">Accumulated transcript will appear here.</div>
+            ) : (
+              <div className="full">
+                {finals.map((c) => c.text).filter(Boolean).join(" ")}
+                {partial.text ? (
+                  <>
+                    {finals.some((c) => c.text) ? " " : ""}
+                    <span className="live-text">{partial.text}</span>
+                  </>
+                ) : null}
+              </div>
+            )}
+          </div>
+        </section>
       </div>
     </div>
   );
