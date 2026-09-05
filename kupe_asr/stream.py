@@ -37,19 +37,29 @@ class Event:
     t: float          # seconds of audio consumed so far
 
 
+def _pick_device(device: str | None) -> str:
+    """cuda > mps (Apple) > cpu, unless a specific device is requested."""
+    if device and device != "auto":
+        return device
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 class StreamingASR:
     def __init__(self, model_dir: str, mimi_id: str = "kyutai/mimi",
                  device: str | None = None, *, pre_llm_threshold: float = 0.30,
                  eos_threshold: float = 0.85, max_context_s: float = 30.0,
                  silence_ms: float = 800.0, silence_rms: float = 0.01,
                  max_new_tokens: int = 200):
-        from transformers import AutoFeatureExtractor, AutoModelForCausalLM, MimiModel
+        from transformers import AutoModelForCausalLM, MimiModel
 
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = _pick_device(device)
         self.tok = load_tokenizer(model_dir)
         self.m = token_map(self.tok)
         self.model = AutoModelForCausalLM.from_pretrained(model_dir).to(self.device).eval()
-        self.fe = AutoFeatureExtractor.from_pretrained(mimi_id)
         self.mimi = MimiModel.from_pretrained(mimi_id).to(self.device).eval()
 
         self.pre_llm_threshold = pre_llm_threshold
@@ -80,12 +90,11 @@ class StreamingASR:
     # --------------------------------------------------------------- codec
     @torch.inference_mode()
     def _encode(self) -> list[int]:
-        inputs = self.fe(raw_audio=self.buffer, sampling_rate=MIMI_SAMPLE_RATE,
-                         return_tensors="pt")
-        iv = inputs["input_values"].to(self.device)
-        pm = inputs.get("padding_mask")
-        pm = pm.to(self.device) if pm is not None else None
-        out = self.mimi.encode(iv, pm, num_quantizers=1)
+        # Mimi wants raw waveform [1,1,T]; build it directly (no feature extractor,
+        # which fails to auto-load on some transformers builds).
+        buf = np.ascontiguousarray(self.buffer, dtype=np.float32)
+        iv = torch.from_numpy(buf).view(1, 1, -1).to(self.device)
+        out = self.mimi.encode(iv, num_quantizers=1)
         return out.audio_codes[0, 0, :].tolist()
 
     def _trailing_silence(self) -> bool:
