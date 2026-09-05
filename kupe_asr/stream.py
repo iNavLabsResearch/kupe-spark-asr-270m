@@ -118,6 +118,9 @@ class StreamingASR:
         if self._done:
             return []
         t = len(self.buffer) / MIMI_SAMPLE_RATE
+        # silence gate: don't decode near-silent audio -> no "the the the" hallucination
+        if len(self.buffer) and float(np.sqrt(np.mean(self.buffer ** 2) + 1e-9)) < self.silence_rms:
+            return []
         codes = self._encode()
         audio_ids = [self.m.mimi_base + int(c) for c in codes]
         control = self.m.lang_auto if lang == "auto" else self.m.lang[lang]
@@ -128,6 +131,7 @@ class StreamingASR:
             input_ids=input_ids, max_new_tokens=self.max_new_tokens,
             do_sample=False, num_beams=1, eos_token_id=self.m.eos,
             pad_token_id=self.m.pad, output_scores=True, return_dict_in_generate=True,
+            repetition_penalty=1.3, no_repeat_ngram_size=3,   # kill "the the the" loops
         )
         new_ids = gen.sequences[0, len(prefix):].tolist()
 
