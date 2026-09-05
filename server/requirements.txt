@@ -1,0 +1,4 @@
+# WebSocket ASR server (install alongside the repo's main requirements.txt)
+fastapi>=0.110
+uvicorn[standard]>=0.27
+websockets>=12.0
