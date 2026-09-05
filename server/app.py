@@ -40,10 +40,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 _ASR: StreamingASR | None = None
-_LOCK = asyncio.Lock()
 _CFG = None
+_BUSY = False  # one live WebSocket; a second caller gets an error, not a queue
 CHUNK_MS = float(os.environ.get("CHUNK_MS", os.environ.get("STEP_EVERY_MS", "1000")))
 STEP_EVERY_MS = CHUNK_MS  # decode hop; default --chunk-ms 1000
+BUSY_MSG = "server busy — only 1 connection allowed"
 
 
 @app.on_event("startup")
@@ -77,6 +78,8 @@ def health():
         "model": _CFG.repos.model if _CFG else None,
         "chunk_ms": CHUNK_MS,
         "rnnoise": bool(_ASR and _ASR.denoiser and _ASR.denoiser.enabled),
+        "busy": _BUSY,
+        "max_connections": 1,
     }
 
 
@@ -94,13 +97,17 @@ def _step(lang: str) -> tuple[list, float]:
 
 @app.websocket("/ws")
 async def ws(sock: WebSocket):
+    global _BUSY
     await sock.accept()
-    if _LOCK.locked():
-        await sock.send_json({"type": "error", "text": "server busy (one session at a time)"})
-        await sock.close()
+    # asyncio is single-threaded: no await between check and set, so a second
+    # handshake cannot sneak in. Do not queue — reject immediately.
+    if _BUSY:
+        await sock.send_json({"type": "error", "code": "busy", "text": BUSY_MSG})
+        await sock.close(code=1013)
         return
-
-    async with _LOCK:
+    _BUSY = True
+    log.info("ws session taken (1/1)")
+    try:
         _ASR.reset()
         sr, lang = 16000, "auto"
         accum_ms = 0.0
@@ -146,3 +153,10 @@ async def ws(sock: WebSocket):
             pass
         except Exception as e:            # never kill the server on one bad session
             log.warning("ws session error: %s", e)
+    finally:
+        _BUSY = False
+        try:
+            _ASR.reset()
+        except Exception:
+            pass
+        log.info("ws session released (0/1)")

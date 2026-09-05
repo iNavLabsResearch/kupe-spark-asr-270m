@@ -135,7 +135,9 @@ export default function App() {
       } else if (m.type === "ready") {
         setStatus(`ready · ${m.sample_rate}Hz · ${m.lang}`);
       } else if (m.type === "error") {
+        setConnected(false);
         setStatus("server: " + m.text);
+        if (m.code === "busy") ws.close();
       }
     };
   }, [ip, lang]);
