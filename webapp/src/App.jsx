@@ -1,7 +1,29 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 
-const DEFAULT_SERVER = "137.184.140.206:8000";
+const DROPLET_HOST = "137.184.140.206";
 const LANGS = ["auto", "en", "hi", "gu", "bn", "ur", "mr"];
+
+function defaultServer() {
+  const env = import.meta.env.VITE_ASR_SERVER;
+  if (env) return env;
+  if (typeof window !== "undefined" && window.location.protocol === "https:") {
+    return DROPLET_HOST; // wss://IP  (Caddy :443) — browsers block ws:// from HTTPS
+  }
+  return `${DROPLET_HOST}:8000`;
+}
+
+/** HTTPS pages must use wss://. Bare host:8000 on HTTPS is remapped to :443. */
+function toWsUrl(input, secure = typeof window !== "undefined" && window.location.protocol === "https:") {
+  const raw = (input || "").trim();
+  if (!raw) return "";
+  if (/^wss?:\/\//i.test(raw)) {
+    const u = raw.replace(/\/+$/, "");
+    return /\/ws$/i.test(u) ? u : `${u}/ws`;
+  }
+  let host = raw.replace(/^https?:\/\//i, "").replace(/\/ws$/i, "").replace(/\/+$/, "");
+  if (secure && /:8000$/.test(host)) host = host.replace(/:8000$/, "");
+  return `${secure ? "wss" : "ws"}://${host}/ws`;
+}
 
 function hue(s) {
   let h = 0;
@@ -37,7 +59,7 @@ function fmtMs(n) {
 }
 
 export default function App() {
-  const [ip, setIp] = useState(DEFAULT_SERVER);
+  const [ip, setIp] = useState(defaultServer);
   const [lang, setLang] = useState("auto");
   const [connected, setConnected] = useState(false);
   const [listening, setListening] = useState(false);
@@ -55,10 +77,7 @@ export default function App() {
   const rightRef = useRef(null);
   const idRef = useRef(0);
 
-  const wsUrl = () => {
-    let s = ip.trim().replace(/^wss?:\/\//, "").replace(/\/ws$/, "");
-    return `ws://${s}/ws`;
-  };
+  const wsUrl = () => toWsUrl(ip);
 
   const pushChunk = (m, e2e, live) => {
     const row = {
@@ -81,9 +100,16 @@ export default function App() {
 
   const connect = useCallback(() => {
     if (!ip.trim()) return setStatus("enter server ip:port first");
-    const ws = new WebSocket(wsUrl());
+    const url = wsUrl();
+    let ws;
+    try {
+      ws = new WebSocket(url);
+    } catch (err) {
+      setStatus(err?.message || "websocket blocked — HTTPS pages need wss://");
+      return;
+    }
     wsRef.current = ws;
-    setStatus("connecting…");
+    setStatus(`connecting ${url}`);
     ws.onopen = () => {
       setConnected(true);
       setStatus("connected");
@@ -94,7 +120,8 @@ export default function App() {
       setStatus("disconnected");
       stopMic();
     };
-    ws.onerror = () => setStatus("ws error — check ip/port & that server is on http (ws)");
+    ws.onerror = () =>
+      setStatus("ws error — HTTPS needs wss:// (Caddy on :443). Local HTTP can still use host:8000");
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
       const e2e = lastSendRef.current ? performance.now() - lastSendRef.current : 0;
@@ -193,7 +220,7 @@ export default function App() {
           <span className={`dot ${dotClass}`} title={status} />
           <input
             className="field server"
-            placeholder="server ip:port"
+            placeholder="host or wss://host/ws"
             value={ip}
             onChange={(e) => setIp(e.target.value)}
             disabled={connected}

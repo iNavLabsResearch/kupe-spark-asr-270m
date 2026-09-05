@@ -1,16 +1,17 @@
-"""FastAPI WebSocket ASR server (plain ws://, no TLS) for the DigitalOcean droplet.
+"""FastAPI WebSocket ASR server for the DigitalOcean droplet.
 
 Loads the trained model once on CPU. One session at a time (fine for a demo box:
 Basic 2 vCPU / 4 GB). The browser sends Float32 PCM audio chunks; the server
 streams back partial / pre_hit_llm / end_of_speech events with per-chunk latency
 and per-token pieces (so the UI can colour them like a tokenizer).
 
-Run on the droplet (from repo root):
-    pip install -r server/requirements.txt -r requirements.txt
-    export HF_TOKEN=hf_xxx
-    uvicorn server.app:app --host 0.0.0.0 --port 8000
+Uvicorn itself stays on http://0.0.0.0:8000 (plain ws://). A Vercel HTTPS UI
+cannot open ws:// — put Caddy in front for wss:// on :443:
 
-Then in the React app connect to:  ws://<DROPLET_IP>:8000/ws
+    bash server/run_https.sh
+
+Then:  ws://<IP>:8000/ws   (local HTTP pages)
+       wss://<IP>/ws       (Vercel / any HTTPS page)
 """
 from __future__ import annotations
 
@@ -24,12 +25,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
 from kupe_asr.config import load_config
 from kupe_asr.hf_utils import hf_login, log
 from kupe_asr.stream import END_OF_SPEECH, PARTIAL, PRE_HIT_LLM, StreamingASR
 
 app = FastAPI(title="kupe-spark-asr-270m ws")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 _ASR: StreamingASR | None = None
 _LOCK = asyncio.Lock()
 _CFG = None

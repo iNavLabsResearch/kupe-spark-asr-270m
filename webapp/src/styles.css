@@ -112,7 +112,7 @@ button, input, select {
 }
 
 .server {
-  width: 210px;
+  width: 260px;
   font-family: var(--font-mono);
   font-size: 12px;
 }

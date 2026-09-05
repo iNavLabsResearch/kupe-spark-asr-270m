@@ -1,0 +1,12 @@
+{
+	email team@kupe.in
+	cert_issuer acme {
+		profile shortlived
+	}
+}
+
+# Let's Encrypt IP cert (short-lived). Uvicorn stays on :8000.
+# Vercel HTTPS UI connects to wss://137.184.140.206/ws
+https://{$ASR_HOST:137.184.140.206} {
+	reverse_proxy 127.0.0.1:8000
+}
