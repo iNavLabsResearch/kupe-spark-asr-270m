@@ -1,7 +1,13 @@
 {
 	email team@kupe.in
+	# IP certs: tls-alpn-01 is rejected by Let's Encrypt ("wrong number of identifiers").
+	# http-01 on :80 is the only challenge that works for 137.184.140.206.
 	cert_issuer acme {
 		profile shortlived
+		disable_tlsalpn_challenge
+	}
+	servers {
+		protocols h1 h2
 	}
 }
 
