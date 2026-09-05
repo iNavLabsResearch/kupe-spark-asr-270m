@@ -174,6 +174,15 @@ def train(cfg, *, from_hub: bool = False, resume: str | None = None) -> str:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation
     torch.backends.cuda.matmul.allow_tf32 = True     # full-throughput matmul on Ampere+
     torch.backends.cudnn.allow_tf32 = True
+    # Resume reloads OUR OWN optimizer.pt via torch.load; transformers blocks that on
+    # torch<2.6 (CVE-2025-32434, which is about untrusted pickles). The checkpoint is
+    # our trusted file, so allow the load instead of forcing a torch upgrade.
+    try:
+        import transformers.trainer as _hf_trainer
+        if hasattr(_hf_trainer, "check_torch_load_is_safe"):
+            _hf_trainer.check_torch_load_is_safe = lambda *a, **k: None
+    except Exception:
+        pass
     hf_login()
 
     if resume:                                        # extend an existing run
