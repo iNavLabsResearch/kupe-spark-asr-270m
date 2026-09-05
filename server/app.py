@@ -5,13 +5,14 @@ Basic 2 vCPU / 4 GB). The browser sends Float32 PCM audio chunks; the server
 streams back partial / pre_hit_llm / end_of_speech events with per-chunk latency
 and per-token pieces (so the UI can colour them like a tokenizer).
 
-Uvicorn itself stays on http://0.0.0.0:8000 (plain ws://). A Vercel HTTPS UI
-cannot open ws:// — put Caddy in front for wss:// on :443:
+Uvicorn itself stays on http://0.0.0.0:8000 (plain ws://). The public URL is
+nginx TLS at spark-asr.kupe.in:
 
-    bash server/run_https.sh
+    # Hostinger DNS:  A  spark-asr  →  137.184.140.206  (TTL 300, not proxied)
+    python server/run.py                 # keep this on :8000
+    sudo bash server/setup_nginx.sh      # nginx + Let's Encrypt
 
-Then:  ws://<IP>:8000/ws   (local HTTP pages)
-       wss://<IP>/ws       (Vercel / any HTTPS page)
+Then the UI connects to:  wss://spark-asr.kupe.in/ws
 """
 from __future__ import annotations
 

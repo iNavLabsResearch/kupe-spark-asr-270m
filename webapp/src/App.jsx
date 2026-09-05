@@ -1,19 +1,14 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 
-const DROPLET_HOST = "137.184.140.206";
+const ASR_HOST = "spark-asr.kupe.in";
 const LANGS = ["auto", "en", "hi", "gu", "bn", "ur", "mr"];
 
 function defaultServer() {
-  const env = import.meta.env.VITE_ASR_SERVER;
-  if (env) return env;
-  if (typeof window !== "undefined" && window.location.protocol === "https:") {
-    return DROPLET_HOST; // wss://IP  (Caddy :443) — browsers block ws:// from HTTPS
-  }
-  return `${DROPLET_HOST}:8000`;
+  return import.meta.env.VITE_ASR_SERVER || ASR_HOST;
 }
 
-/** HTTPS pages must use wss://. Bare host:8000 on HTTPS is remapped to :443. */
-function toWsUrl(input, secure = typeof window !== "undefined" && window.location.protocol === "https:") {
+/** Domain (nginx TLS) → wss. Raw ip:8000 on a local HTTP page → ws. */
+function toWsUrl(input, pageHttps = typeof window !== "undefined" && window.location.protocol === "https:") {
   const raw = (input || "").trim();
   if (!raw) return "";
   if (/^wss?:\/\//i.test(raw)) {
@@ -21,7 +16,9 @@ function toWsUrl(input, secure = typeof window !== "undefined" && window.locatio
     return /\/ws$/i.test(u) ? u : `${u}/ws`;
   }
   let host = raw.replace(/^https?:\/\//i, "").replace(/\/ws$/i, "").replace(/\/+$/, "");
-  if (secure && /:8000$/.test(host)) host = host.replace(/:8000$/, "");
+  const ipPort = /^\d+\.\d+\.\d+\.\d+(:\d+)?$/.test(host);
+  if (pageHttps && /:8000$/.test(host)) host = host.replace(/:8000$/, "");
+  const secure = pageHttps || !ipPort;
   return `${secure ? "wss" : "ws"}://${host}/ws`;
 }
 
@@ -220,7 +217,7 @@ export default function App() {
           <span className={`dot ${dotClass}`} title={status} />
           <input
             className="field server"
-            placeholder="host or wss://host/ws"
+            placeholder="spark-asr.kupe.in"
             value={ip}
             onChange={(e) => setIp(e.target.value)}
             disabled={connected}
