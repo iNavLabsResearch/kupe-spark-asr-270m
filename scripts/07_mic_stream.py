@@ -43,7 +43,7 @@ def main():
         ap.add_argument(f"--{L}", dest="lang", action="store_const", const=L)
     ap.add_argument("--device", default="auto", choices=["auto", "mps", "cpu", "cuda"])
     ap.add_argument("--samplerate", type=int, default=16000, help="mic sample rate")
-    ap.add_argument("--chunk-ms", type=int, default=500, help="audio pushed per step")
+    ap.add_argument("--chunk-ms", type=int, default=1000, help="audio pushed per step")
     args = ap.parse_args()
 
     lang = args.lang or "auto"

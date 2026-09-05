@@ -11,6 +11,7 @@ huggingface_hub>=0.24.0
 soundfile>=0.12
 librosa>=0.10
 soxr>=0.3                 # fast resampling backend for librosa
+pyrnnoise>=0.4.0          # RNNoise before ASR (live server + mic stream)
 
 # --- metrics / tracking ---
 jiwer>=3.0               # WER / CER

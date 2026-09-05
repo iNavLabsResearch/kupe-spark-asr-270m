@@ -42,6 +42,8 @@ app.add_middleware(
 _ASR: StreamingASR | None = None
 _LOCK = asyncio.Lock()
 _CFG = None
+CHUNK_MS = float(os.environ.get("CHUNK_MS", os.environ.get("STEP_EVERY_MS", "1000")))
+STEP_EVERY_MS = CHUNK_MS  # decode hop; default --chunk-ms 1000
 
 
 @app.on_event("startup")
@@ -55,27 +57,33 @@ def _load():
         log.info("downloading model %s …", _CFG.repos.model)
         model_dir = snapshot_download(_CFG.repos.model, repo_type="model")
     s = _CFG.stream
+    denoise = os.environ.get("DENOISE", "1").lower() not in ("0", "false", "off")
     _ASR = StreamingASR(
         model_dir, device="cpu",
         pre_llm_threshold=s.pre_llm_threshold, eos_threshold=s.eos_threshold,
         max_context_s=s.max_context_s, silence_ms=s.silence_ms,
         max_new_tokens=min(120, int(_CFG.eval.max_new_tokens)),  # cap for CPU latency
+        denoise=denoise,
     )
-    log.info("ASR ready on CPU — ws endpoint /ws")
+    log.info("ASR ready on CPU — ws /ws · chunk %d ms · rnnoise %s",
+             int(CHUNK_MS),
+             "on" if (_ASR.denoiser and _ASR.denoiser.enabled) else "OFF")
 
 
 @app.get("/")
 def health():
-    return {"ok": _ASR is not None, "model": _CFG.repos.model if _CFG else None}
+    return {
+        "ok": _ASR is not None,
+        "model": _CFG.repos.model if _CFG else None,
+        "chunk_ms": CHUNK_MS,
+        "rnnoise": bool(_ASR and _ASR.denoiser and _ASR.denoiser.enabled),
+    }
 
 
 def _pieces(text: str) -> list[str]:
     """Token pieces for colouring (sentencepiece ▁ shown as a leading space)."""
     ids = _ASR.tok(text, add_special_tokens=False).input_ids
     return [p.replace("▁", " ") for p in _ASR.tok.convert_ids_to_tokens(ids)]
-
-
-STEP_EVERY_MS = float(os.environ.get("STEP_EVERY_MS", "700"))  # throttle decode on CPU
 
 
 def _step(lang: str) -> tuple[list, float]:
@@ -109,7 +117,11 @@ async def ws(sock: WebSocket):
                     lang = str(cfg.get("lang", lang))
                     _ASR.reset()
                     accum_ms = 0.0
-                    await sock.send_json({"type": "ready", "sample_rate": sr, "lang": lang})
+                    await sock.send_json({
+                        "type": "ready", "sample_rate": sr, "lang": lang,
+                        "chunk_ms": CHUNK_MS,
+                        "rnnoise": bool(_ASR.denoiser and _ASR.denoiser.enabled),
+                    })
                     continue
                 data = msg.get("bytes")
                 if not data:

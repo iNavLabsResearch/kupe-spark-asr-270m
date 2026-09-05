@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from .constants import LANG_CODES, MIMI_SAMPLE_RATE
+from .denoise import StreamingRNNoise
 from .tokenizer import load_tokenizer, token_map
 
 PARTIAL = "partial"
@@ -53,7 +54,7 @@ class StreamingASR:
                  device: str | None = None, *, pre_llm_threshold: float = 0.30,
                  eos_threshold: float = 0.85, max_context_s: float = 30.0,
                  silence_ms: float = 800.0, silence_rms: float = 0.01,
-                 max_new_tokens: int = 200):
+                 max_new_tokens: int = 200, denoise: bool = True):
         from transformers import AutoModelForCausalLM, MimiModel
 
         self.device = _pick_device(device)
@@ -68,16 +69,23 @@ class StreamingASR:
         self.silence_ms = silence_ms
         self.silence_rms = silence_rms
         self.max_new_tokens = max_new_tokens
+        self.denoiser = StreamingRNNoise() if denoise else None
         self.reset()
 
     def reset(self) -> None:
         self.buffer = np.zeros(0, dtype=np.float32)
         self._fired_pre = False
         self._done = False
+        if getattr(self, "denoiser", None) is not None:
+            self.denoiser.reset()
 
     # --------------------------------------------------------------- input
     def add_audio(self, chunk: np.ndarray, sr: int) -> None:
         chunk = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if self.denoiser is not None:
+            chunk, sr = self.denoiser.process(chunk, sr)
+            if chunk.size == 0:
+                return
         if sr != MIMI_SAMPLE_RATE:
             import librosa
             chunk = librosa.resample(chunk, orig_sr=sr, target_sr=MIMI_SAMPLE_RATE)
@@ -164,7 +172,7 @@ class StreamingASR:
 
 
 def transcribe_file(model_dir: str, wav_path: str, lang: str = "auto",
-                    chunk_ms: float = 320, **kw):
+                    chunk_ms: float = 1000, **kw):
     """Simulate streaming over a wav file; yield Events in order."""
     import soundfile as sf
 
